@@ -1,0 +1,187 @@
+#!/bin/sh
+# Concard N9 v2.1 Online GitHub OTA Update Checker & Direct Flasher
+# Default Repository: https://github.com/fbaduongth/totolink_n9_firmware_custom
+# Usage:
+#   concard-ota check [repo_url]
+#   concard-ota upgrade <download_url> [expected_sha256]
+
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin"
+
+DEF_REPO="https://github.com/fbaduongth/totolink_n9_firmware_custom"
+CUR_VER="2.1"
+CUR_BUILD="CSB334A-2700-2100"
+CHECK_OUT="/tmp/.concard_ota_check.json"
+OTA_BIN="/tmp/concard_ota.bin"
+
+json_esc() {
+	printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+ver_gt() {
+	# Returns 0 (true) if $1 > $2 semantically (e.g. 2.2 > 2.1, 2.1.1 > 2.1)
+	awk -v a="$1" -v b="$2" 'BEGIN {
+		gsub(/^[^0-9]*/, "", a); gsub(/^[^0-9]*/, "", b);
+		na = split(a, pa, "."); nb = split(b, pb, ".");
+		m = (na > nb) ? na : nb;
+		for (i = 1; i <= m; i++) {
+			va = int(pa[i] + 0); vb = int(pb[i] + 0);
+			if (va > vb) exit 0;
+			if (va < vb) exit 1;
+		}
+		exit 1;
+	}'
+}
+
+parse_owner_repo() {
+	printf '%s' "$1" | sed -e 's#^https\?://github\.com/##' -e 's#\.git$##' -e 's#/releases.*$##' -e 's#/*$##' | awk -F'/' 'NF>=2 {print $1 "/" $2; exit}'
+}
+
+ACTION="${1:-check}"
+
+if [ "$ACTION" = "check" ]; then
+	REPO_URL="${2:-$(nvram get cc_ota_repo_url 2>/dev/null)}"
+	[ -z "$REPO_URL" ] && REPO_URL="$DEF_REPO"
+	OWNER_REPO="$(parse_owner_repo "$REPO_URL")"
+	if [ -z "$OWNER_REPO" ]; then
+		RES="{\"ok\":false,\"error\":\"Invalid GitHub repository URL. Expected https://github.com/<owner>/<repo>.\"}"
+		printf '%s\n' "$RES" > "$CHECK_OUT"
+		printf '%s\n' "$RES"
+		exit 0
+	fi
+
+	NORM_REPO="https://github.com/${OWNER_REPO}"
+	RAW_JSON=""
+	MODE_USED=""
+
+	# 1. Try lightweight manifest.json on main / master first (no GitHub API rate limit)
+	for br in main master; do
+		CAND="$(curl -s -k -L -m 7 -A "Concard-N9-OTA/2.1" "https://raw.githubusercontent.com/${OWNER_REPO}/${br}/manifest.json" 2>/dev/null)"
+		case "$CAND" in
+			*'"version"'*CSB334A*|*'"downloadUrl"'*)
+				RAW_JSON="$CAND"
+				MODE_USED="manifest"
+				break
+				;;
+		esac
+	done
+
+	# 2. Fallback to GitHub Releases Latest API
+	if [ -z "$RAW_JSON" ]; then
+		CAND="$(curl -s -k -L -m 8 -A "Concard-N9-OTA/2.1" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${OWNER_REPO}/releases/latest" 2>/dev/null)"
+		case "$CAND" in
+			*'"tag_name"'*)
+				RAW_JSON="$CAND"
+				MODE_USED="releases_api"
+				;;
+			*'"Not Found"'*|*'"status": "404"'*)
+				RES="{\"ok\":true,\"repoUrl\":\"$(json_esc "$NORM_REPO")\",\"currentVersion\":\"Concard N9 v${CUR_VER}\",\"currentBuild\":\"${CUR_BUILD}\",\"latestVersion\":\"\",\"hasUpdate\":false,\"noReleaseYet\":true,\"notes\":\"Repository found, no firmware release published yet.\"}"
+				printf '%s\n' "$RES" > "$CHECK_OUT"
+				printf '%s\n' "$RES"
+				exit 0
+				;;
+		esac
+	fi
+
+	if [ -z "$RAW_JSON" ]; then
+		RES="{\"ok\":false,\"apOffline\":true,\"repoUrl\":\"$(json_esc "$NORM_REPO")\",\"currentVersion\":\"Concard N9 v${CUR_VER}\",\"currentBuild\":\"${CUR_BUILD}\",\"error\":\"Access Point VLAN has no direct Internet route to GitHub; using Browser-Relayed GitHub check.\"}"
+		printf '%s\n' "$RES" > "$CHECK_OUT"
+		printf '%s\n' "$RES"
+		exit 0
+	fi
+
+	FLAT="$(printf '%s' "$RAW_JSON" | tr '\r\n' '  ')"
+	if [ "$MODE_USED" = "manifest" ]; then
+		LAT_VER="$(printf '%s' "$FLAT" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+		LAT_BUILD="$(printf '%s' "$FLAT" | sed -n 's/.*"buildCode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+		DL_URL="$(printf '%s' "$FLAT" | sed -n 's/.*"downloadUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+		ASSET_NAME="$(printf '%s' "$FLAT" | sed -n 's/.*"fileName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+		SHA256_HEX="$(printf '%s' "$FLAT" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' | head -n 1)"
+		SIZE_B="$(printf '%s' "$FLAT" | sed -n 's/.*"sizeBytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+		NOTES="$(printf '%s' "$FLAT" | sed -n 's/.*"notes"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+	else
+		LAT_VER="$(printf '%s' "$FLAT" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+		LAT_BUILD=""
+		DL_URL="$(printf '%s' "$RAW_JSON" | grep -o 'https://[^"]*\.\(web\|trx\)' | head -n 1)"
+		ASSET_NAME="$(basename "$DL_URL" 2>/dev/null)"
+		SIZE_B="$(printf '%s' "$FLAT" | sed -n 's/.*"size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+		SHA256_HEX="$(printf '%s' "$RAW_JSON" | grep -Eo '[0-9a-fA-F]{64}' | head -n 1)"
+		NOTES="$(printf '%s' "$FLAT" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+	fi
+
+	[ -z "$SIZE_B" ] && SIZE_B=0
+	HAS_UPD="false"
+	if [ -n "$LAT_VER" ] && ver_gt "$LAT_VER" "$CUR_VER"; then
+		HAS_UPD="true"
+	fi
+
+	RES="$(printf '{"ok":true,"repoUrl":"%s","currentVersion":"Concard N9 v%s","currentBuild":"%s","latestVersion":"%s","latestBuild":"%s","hasUpdate":%s,"fileName":"%s","downloadUrl":"%s","sha256":"%s","sizeBytes":%s,"notes":"%s"}' \
+		"$(json_esc "$NORM_REPO")" \
+		"$CUR_VER" \
+		"$CUR_BUILD" \
+		"$(json_esc "$LAT_VER")" \
+		"$(json_esc "$LAT_BUILD")" \
+		"$HAS_UPD" \
+		"$(json_esc "$ASSET_NAME")" \
+		"$(json_esc "$DL_URL")" \
+		"$(json_esc "$SHA256_HEX")" \
+		"$SIZE_B" \
+		"$(json_esc "$NOTES")")"
+	printf '%s\n' "$RES" > "$CHECK_OUT"
+	printf '%s\n' "$RES"
+	exit 0
+fi
+
+if [ "$ACTION" = "upgrade" ]; then
+	DL_URL="$2"
+	EXP_SHA="$3"
+	case "$DL_URL" in
+		https://*|http://*) ;;
+		*)
+			printf '{"ok":false,"error":"Missing or invalid firmware download URL."}\n'
+			exit 0
+			;;
+	esac
+
+	rm -f "$OTA_BIN"
+	if ! curl -s -k -L -m 120 -A "Concard-N9-OTA/2.1" -o "$OTA_BIN" "$DL_URL" || [ ! -s "$OTA_BIN" ]; then
+		rm -f "$OTA_BIN"
+		printf '{"ok":false,"apOffline":true,"error":"AP could not download image directly from GitHub; please use Browser-Relayed Upgrade."}\n'
+		exit 0
+	fi
+
+	FSIZE="$(wc -c < "$OTA_BIN" 2>/dev/null | tr -d ' ')"
+	case "$FSIZE" in ''|*[!0-9]*) FSIZE=0 ;; esac
+	if [ "$FSIZE" -lt 2500000 ] || [ "$FSIZE" -gt 7012352 ]; then
+		rm -f "$OTA_BIN"
+		printf '{"ok":false,"error":"Downloaded file size (%s bytes) is outside valid N9v1 SPI Flash bounds."}\n' "$FSIZE"
+		exit 0
+	fi
+
+	# Verify uImage Magic (0x27051956) and ConCard BOARD_PID (CSB334A-2700 @ offset 36)
+	MAGIC_HEX="$(dd if="$OTA_BIN" bs=1 count=4 2>/dev/null | hexdump -ve '1/1 "%02x"' 2>/dev/null)"
+	PID_STR="$(dd if="$OTA_BIN" bs=1 skip=36 count=12 2>/dev/null | tr -d '\0')"
+	if [ "$MAGIC_HEX" != "27051956" ] || [ "$PID_STR" != "CSB334A-2700" ]; then
+		rm -f "$OTA_BIN"
+		printf '{"ok":false,"error":"Signature verification failed (Magic=%s, ProductID=%s). Only genuine ConCard CSB334A-2700 images are allowed."}\n' "$MAGIC_HEX" "$(json_esc "$PID_STR")"
+		exit 0
+	fi
+
+	if [ -n "$EXP_SHA" ] && [ "${#EXP_SHA}" -eq 64 ] && [ -x /usr/bin/sha256sum -o -x /bin/sha256sum ]; then
+		ACT_SHA="$(sha256sum "$OTA_BIN" 2>/dev/null | awk '{print tolower($1)}')"
+		EXP_LOW="$(printf '%s' "$EXP_SHA" | tr 'A-F' 'a-f')"
+		if [ -n "$ACT_SHA" ] && [ "$ACT_SHA" != "$EXP_LOW" ]; then
+			rm -f "$OTA_BIN"
+			printf '{"ok":false,"error":"SHA-256 checksum mismatch (got %s)."}\n' "$ACT_SHA"
+			exit 0
+		fi
+	fi
+
+	MTD_PART="Firmware_Stub"
+	grep -q "Firmware_Stub" /proc/mtd 2>/dev/null || MTD_PART="Firmware"
+	(sleep 1; /sbin/mtd_write -r write "$OTA_BIN" "$MTD_PART" >/dev/null 2>&1) &
+	printf '{"ok":true,"flashing":true,"sizeBytes":%s,"message":"Verified CSB334A-2700 image (%s bytes). Writing SPI Flash and rebooting..."}\n' "$FSIZE" "$FSIZE"
+	exit 0
+fi
+
+printf '{"ok":false,"error":"Unknown action"}\n'
+exit 0

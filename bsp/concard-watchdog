@@ -1,0 +1,223 @@
+#!/bin/sh
+# Concard N9 v2.1 Background Enterprise Watchdog:
+#   1) DHCP Option 12 Hostname Sync + Smart Fallback Rescue IP Alias (192.168.1.165 on br0:fb)
+#   2) Zero-Touch Controller Phone-Home Heartbeat (startup, IP change, and every 120s)
+#   3) Adaptive Cell Breathing (38+ STAs -> -74 dBm; <=28 STAs -> restore NVRAM rt_AssocReqRssiThres)
+#   4) Self-healing supervision for concard-dhcp-fp & CONCARD_DHCP_GUARD ebtables chains
+
+PIDFILE="/var/run/concard_watchdog.pid"
+
+if [ -f "$PIDFILE" ]; then
+	OLD_PID="$(cat "$PIDFILE" 2>/dev/null)"
+	if [ -n "$OLD_PID" ] && [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+		exit 0
+	fi
+fi
+
+echo "$$" > "$PIDFILE"
+trap 'rm -f "$PIDFILE"; exit 0' INT TERM EXIT
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
+}
+
+get_sta_count() {
+	if [ ! -d /sys/class/net/ra0 ]; then
+		echo 0
+		return
+	fi
+	CNT="$(curl -s -m 1 http://127.0.0.1/api_telemetry.cgi 2>/dev/null | sed -n 's/.*"staCount":\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+	if [ -z "$CNT" ] && [ -x /usr/bin/mca-dump ]; then
+		CNT="$(/usr/bin/mca-dump 2>/dev/null | awk -F'"num_sta":' 'NF>1{split($2,a,","); s+=int(a[1])} END{print s+0}')"
+	fi
+	case "$CNT" in
+		''|*[!0-9]*) CNT=0 ;;
+	esac
+	echo "$CNT"
+}
+
+send_heartbeat() {
+	CUR_IP="$1"
+	[ -z "$CUR_IP" ] || [ "$CUR_IP" = "0.0.0.0" ] || [ "$CUR_IP" = "192.168.1.165" ] && return 1
+
+	CTRL_URL=""
+	if [ -s /tmp/.concard_ctrl_url ]; then
+		CTRL_URL="$(head -n 1 /tmp/.concard_ctrl_url 2>/dev/null | tr -d '\r\n ')"
+	fi
+	if [ -z "$CTRL_URL" ]; then
+		CTRL_URL="$(nvram get cc_ctrl_url 2>/dev/null | tr -d '\r\n ')"
+	fi
+	case "$CTRL_URL" in
+		http://*|https://*) ;;
+		*) return 1 ;;
+	esac
+	CTRL_URL="${CTRL_URL%/}"
+
+	AP_MAC=""
+	for dev in ra0 br0 eth2; do
+		if [ -r "/sys/class/net/$dev/address" ]; then
+			AP_MAC="$(cat "/sys/class/net/$dev/address" 2>/dev/null | tr 'a-f' 'A-F')"
+			[ -n "$AP_MAC" ] && break
+		fi
+	done
+	[ -z "$AP_MAC" ] && AP_MAC="00:00:00:00:00:00"
+
+	HN="$(nvram get computer_name 2>/dev/null)"
+	[ -z "$HN" ] && HN="Concard-N9"
+	LOC="$(nvram get cc_device_loc 2>/dev/null)"
+	SSID="$(nvram get rt_ssid 2>/dev/null)"
+	[ -z "$SSID" ] && SSID="Concard-N9"
+	CH="$(nvram get rt_channel 2>/dev/null)"
+	[ -z "$CH" ] && CH=0
+	case "$CH" in ''|*[!0-9]*) CH=0 ;; esac
+	UP="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"
+	[ -z "$UP" ] && UP=0
+
+	PAYLOAD="$(printf '{"mac":"%s","ip":"%s","hostname":"%s","location":"%s","firmware":"Concard N9 v2.1","channel":%d,"ssid":"%s","uptime":%d}' \
+		"$(json_escape "$AP_MAC")" \
+		"$(json_escape "$CUR_IP")" \
+		"$(json_escape "$HN")" \
+		"$(json_escape "$LOC")" \
+		"$CH" \
+		"$(json_escape "$SSID")" \
+		"$UP")"
+
+	curl -s -m 3 -X POST \
+		-H "Content-Type: application/json" \
+		-H "X-ConCard-Heartbeat: v2.1" \
+		"${CTRL_URL}/api/ap/heartbeat" \
+		-d "$PAYLOAD" >/dev/null 2>&1 || true
+	return 0
+}
+
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin"
+
+LAST_HB_IP=""
+LAST_HB_UP=0
+FB_ALIAS_ACTIVE=0
+
+# Wait 8s after boot so Padavan rc finishes starting primary udhcpc cleanly
+sleep 8
+
+while true; do
+	# 0. Self-healing L2 Shield & Zero-CPU DHCP Fingerprint daemon
+	if [ -x /bin/ebtables ] && ! /bin/ebtables -t filter -L CONCARD_DHCP_GUARD >/dev/null 2>&1; then
+		[ -x /usr/sbin/concard-vlan-apply ] && /usr/sbin/concard-vlan-apply >/dev/null 2>&1 || true
+	fi
+	if [ -x /usr/sbin/concard-dhcp-fp ] && ! pidof concard-dhcp-fp >/dev/null 2>&1; then
+		/usr/sbin/concard-dhcp-fp >/dev/null 2>&1 &
+	fi
+
+	SW_MODE="$(nvram get sw_mode 2>/dev/null)"
+	LAN_PROTO="$(nvram get lan_proto_x 2>/dev/null)"
+	HN="$(nvram get computer_name 2>/dev/null | tr ' ' '-')"
+	[ -z "$HN" ] && HN="Concard-N9"
+
+	NOW_UP="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"
+	[ -z "$NOW_UP" ] && NOW_UP=0
+
+	# 1. DHCP Option 12 Hostname Sync + Smart Rescue Alias (br0:fb = 192.168.1.165/24) in AP DHCP mode
+	if [ "$SW_MODE" = "3" ] && [ "$LAN_PROTO" = "1" ]; then
+		PREV_HN="$(cat /tmp/.concard_dhcp_hn 2>/dev/null)"
+		ALL_UD_PIDS="$(pidof udhcpc 2>/dev/null)"
+		UD_CNT=0
+		CMD_OK=0
+		for upid in $ALL_UD_PIDS; do
+			UD_CNT=$((UD_CNT + 1))
+			if [ -r "/proc/${upid}/cmdline" ]; then
+				CMD_STR="$(tr '\0' ' ' < "/proc/${upid}/cmdline" 2>/dev/null)"
+				case "$CMD_STR" in
+					*" -H ${HN} "*|*" -H ${HN}") CMD_OK=1 ;;
+				esac
+			fi
+		done
+		if [ "$UD_CNT" -gt 1 ]; then
+			CMD_OK=0
+		fi
+		if [ -n "$PREV_HN" ] && [ "$PREV_HN" != "$HN" ]; then
+			CMD_OK=0
+		fi
+		if [ "$CMD_OK" = "0" ] && [ -d /sys/class/net/br0 ]; then
+			echo "$HN" > /proc/sys/kernel/hostname 2>/dev/null || true
+			[ -L /tmp/udhcpc_lan.script ] || ln -sf /sbin/rc /tmp/udhcpc_lan.script 2>/dev/null || true
+			killall -USR2 udhcpc 2>/dev/null || true
+			usleep 200000 2>/dev/null || sleep 1
+			killall -q udhcpc 2>/dev/null || true
+			usleep 150000 2>/dev/null || true
+			killall -9 udhcpc 2>/dev/null || true
+			rm -f /var/run/udhcpc_lan.pid
+			/sbin/udhcpc -i br0 -s /tmp/udhcpc_lan.script -p /var/run/udhcpc_lan.pid -t4 -T2 -d -H "$HN" >/dev/null 2>&1 || true
+			echo "$HN" > /tmp/.concard_dhcp_hn
+		elif [ "$CMD_OK" = "1" ] && [ "$PREV_HN" != "$HN" ]; then
+			echo "$HN" > /tmp/.concard_dhcp_hn
+		fi
+
+		# Smart Fallback Rescue IP Alias (192.168.1.165/24 on br0:fb) when no DHCP lease after 12s
+		DHCP_IP="$(nvram get lan_ipaddr_t 2>/dev/null)"
+		if [ -n "$DHCP_IP" ] && [ "$DHCP_IP" != "0.0.0.0" ] && [ "$DHCP_IP" != "192.168.1.165" ]; then
+			if [ "$FB_ALIAS_ACTIVE" = "1" ] || ifconfig br0:fb 2>/dev/null | grep -q "inet addr:"; then
+				ifconfig br0:fb 0.0.0.0 down >/dev/null 2>&1 || true
+				FB_ALIAS_ACTIVE=0
+			fi
+		elif [ "$NOW_UP" -ge 12 ] && [ -d /sys/class/net/br0 ]; then
+			BR_MAIN_IP="$(ifconfig br0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -n 1)"
+			if [ "$BR_MAIN_IP" != "192.168.1.165" ]; then
+				if ! ifconfig br0:fb 2>/dev/null | grep -q "192.168.1.165"; then
+					ifconfig br0:fb 192.168.1.165 netmask 255.255.255.0 up >/dev/null 2>&1 || true
+				fi
+				FB_ALIAS_ACTIVE=1
+			fi
+		fi
+	elif [ "$FB_ALIAS_ACTIVE" = "1" ]; then
+		ifconfig br0:fb 0.0.0.0 down >/dev/null 2>&1 || true
+		FB_ALIAS_ACTIVE=0
+	fi
+
+	# 2. Zero-Touch Phone-Home Heartbeat (startup, IP change, or every 120s)
+	CUR_IP="$(nvram get lan_ipaddr_t 2>/dev/null)"
+	if [ -z "$CUR_IP" ] || [ "$CUR_IP" = "0.0.0.0" ]; then
+		CUR_IP="$(nvram get lan_ipaddr 2>/dev/null)"
+	fi
+
+	if [ -n "$CUR_IP" ] && [ "$CUR_IP" != "0.0.0.0" ] && [ "$CUR_IP" != "192.168.1.165" ]; then
+		ELAPSED=$((NOW_UP - LAST_HB_UP))
+		if [ "$CUR_IP" != "$LAST_HB_IP" ] || [ "$LAST_HB_UP" -eq 0 ] || [ "$ELAPSED" -ge 120 ]; then
+			if send_heartbeat "$CUR_IP"; then
+				LAST_HB_IP="$CUR_IP"
+				LAST_HB_UP="$NOW_UP"
+			fi
+		fi
+	fi
+
+	# 3. Adaptive Cell Breathing (every 15s)
+	CB_EN="$(nvram get cc_cell_breathing 2>/dev/null)"
+	[ -z "$CB_EN" ] && CB_EN="1"
+	ACTIVE_NOW="$(cat /tmp/.concard_breathing_active 2>/dev/null)"
+	[ -z "$ACTIVE_NOW" ] && ACTIVE_NOW="0"
+
+	if [ -d /sys/class/net/ra0 ]; then
+		if [ "$CB_EN" != "0" ]; then
+			STA_CNT="$(get_sta_count)"
+			if [ "$STA_CNT" -ge 38 ] && [ "$ACTIVE_NOW" != "1" ]; then
+				iwpriv ra0 set AssocReqRssiThres=-74 >/dev/null 2>&1 || true
+				echo 1 > /tmp/.concard_breathing_active
+			elif [ "$STA_CNT" -le 28 ] && [ "$ACTIVE_NOW" = "1" ]; then
+				BASE_THRES="$(nvram get rt_AssocReqRssiThres 2>/dev/null)"
+				case "$BASE_THRES" in
+					''|*[!0-9-]*) BASE_THRES="-84" ;;
+				esac
+				iwpriv ra0 set "AssocReqRssiThres=${BASE_THRES}" >/dev/null 2>&1 || true
+				echo 0 > /tmp/.concard_breathing_active
+			fi
+		elif [ "$ACTIVE_NOW" = "1" ]; then
+			BASE_THRES="$(nvram get rt_AssocReqRssiThres 2>/dev/null)"
+			case "$BASE_THRES" in
+				''|*[!0-9-]*) BASE_THRES="-84" ;;
+			esac
+			iwpriv ra0 set "AssocReqRssiThres=${BASE_THRES}" >/dev/null 2>&1 || true
+			echo 0 > /tmp/.concard_breathing_active
+		fi
+	fi
+
+	sleep 15
+done

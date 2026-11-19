@@ -1,0 +1,92 @@
+#!/bin/sh
+# Concard N9 v2.0 Ceiling AP Visual Locator (Alternating Blue GPIO 11 / Red GPIO 39 @ 250ms)
+# Usage: concard-locate-led [seconds]   (default: 30; 0 or stop cancels immediately)
+
+PIDFILE="/var/run/concard_locate.pid"
+UNTIL_FILE="/tmp/.concard_locate_until"
+ARG="${1:-30}"
+
+stop_previous() {
+	if [ -f "$PIDFILE" ]; then
+		OLD_PID="$(cat "$PIDFILE" 2>/dev/null)"
+		if [ -n "$OLD_PID" ] && [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+			kill "$OLD_PID" 2>/dev/null || true
+			usleep 100000 2>/dev/null || sleep 1
+			kill -9 "$OLD_PID" 2>/dev/null || true
+		fi
+		rm -f "$PIDFILE"
+	fi
+}
+
+restore_leds() {
+	if ! killall -SIGHUP detect_link 2>/dev/null; then
+		/sbin/leds_front 1 >/dev/null 2>&1 || true
+	fi
+}
+
+case "$ARG" in
+	0|stop|off|cancel)
+		rm -f "$UNTIL_FILE"
+		stop_previous
+		restore_leds
+		exit 0
+		;;
+	''|*[!0-9]*)
+		SEC=30
+		;;
+	*)
+		SEC="$ARG"
+		;;
+esac
+
+[ "$SEC" -le 0 ] && {
+	rm -f "$UNTIL_FILE"
+	stop_previous
+	restore_leds
+	exit 0
+}
+[ "$SEC" -gt 300 ] && SEC=300
+
+stop_previous
+
+MY_PID="$$"
+echo "$MY_PID" > "$PIDFILE"
+NOW_UP="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"
+[ -z "$NOW_UP" ] && NOW_UP=0
+EXP_UP=$((NOW_UP + SEC))
+echo "$EXP_UP" > "$UNTIL_FILE"
+
+CLEANED=0
+cleanup() {
+	[ "$CLEANED" = "1" ] && return
+	CLEANED=1
+	CUR_OWNER="$(cat "$PIDFILE" 2>/dev/null)"
+	if [ -z "$CUR_OWNER" ] || [ "$CUR_OWNER" = "$MY_PID" ]; then
+		rm -f "$UNTIL_FILE" "$PIDFILE"
+		restore_leds
+	fi
+}
+
+trap 'cleanup; exit 0' INT TERM HUP
+trap 'cleanup' EXIT
+
+while [ -f "$UNTIL_FILE" ]; do
+	NOW_UP="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"
+	[ -z "$NOW_UP" ] && NOW_UP=0
+	[ "$NOW_UP" -ge "$EXP_UP" ] && break
+
+	/sbin/mtk_gpio -w 11 0 >/dev/null 2>&1
+	/sbin/mtk_gpio -w 39 1 >/dev/null 2>&1
+	usleep 250000 2>/dev/null || sleep 1
+
+	[ -f "$UNTIL_FILE" ] || break
+	NOW_UP="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"
+	[ -z "$NOW_UP" ] && NOW_UP=0
+	[ "$NOW_UP" -ge "$EXP_UP" ] && break
+
+	/sbin/mtk_gpio -w 11 1 >/dev/null 2>&1
+	/sbin/mtk_gpio -w 39 0 >/dev/null 2>&1
+	usleep 250000 2>/dev/null || sleep 1
+done
+
+exit 0

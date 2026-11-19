@@ -1,0 +1,143 @@
+#!/bin/sh
+# Concard N9 v2.1 Enterprise Radio Tuning, Per-Host Fair Queueing, L2 Shield, Guest VLAN & Daemons
+
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin"
+
+HN="$(nvram get computer_name 2>/dev/null)"
+[ -n "$HN" ] && echo "$HN" > /proc/sys/kernel/hostname 2>/dev/null || true
+
+# 1. Per-Host Fair Queueing (FQ-CoDel + cls_flow per-IP hash, ~0% CPU on MT7620A)
+FAIR_Q="$(nvram get cc_fair_queue 2>/dev/null)"
+[ -z "$FAIR_Q" ] && FAIR_Q="1"
+
+setup_iface_qdisc() {
+	DEV="$1"
+	KEY_DIR="$2"
+	[ -d "/sys/class/net/$DEV" ] || return 0
+	tc qdisc del dev "$DEV" root >/dev/null 2>&1 || true
+	tc qdisc add dev "$DEV" root handle 1: fq_codel quantum 300 limit 1024 flows 1024 noecn >/dev/null 2>&1 || true
+	if [ "$FAIR_Q" != "0" ]; then
+		tc filter add dev "$DEV" parent 1: protocol all prio 1 handle 1 flow hash keys "$KEY_DIR" divisor 1024 baseclass 1:1 >/dev/null 2>&1 || true
+	fi
+}
+
+if [ "$FAIR_Q" != "0" ]; then
+	/sbin/modprobe cls_flow 2>/dev/null || true
+fi
+setup_iface_qdisc eth2 src
+setup_iface_qdisc ra0 dst
+setup_iface_qdisc ra1 dst
+
+# 2. 802.11e QBSS Load & Corridor Probe Request Noise Suppression (ProbeRspRssi / ApProbeRspTimes)
+if [ -d /sys/class/net/ra0 ]; then
+	QLOAD_EN="$(nvram get cc_qload_enable 2>/dev/null)"
+	[ -z "$QLOAD_EN" ] && QLOAD_EN="1"
+	PROBE_RSSI="$(nvram get cc_probe_rssi 2>/dev/null)"
+	case "$PROBE_RSSI" in
+		''|*[!0-9-]*) PROBE_RSSI="-82" ;;
+	esac
+
+	iwpriv ra0 set "QloadEnable=${QLOAD_EN}" >/dev/null 2>&1 || true
+	iwpriv ra0 set ApProbeRspTimes=2 >/dev/null 2>&1 || true
+	iwpriv ra0 set "ProbeRspRssi=${PROBE_RSSI}" >/dev/null 2>&1 || true
+	if [ -d /sys/class/net/ra1 ]; then
+		iwpriv ra1 set ApProbeRspTimes=2 >/dev/null 2>&1 || true
+		iwpriv ra1 set "ProbeRspRssi=${PROBE_RSSI}" >/dev/null 2>&1 || true
+	fi
+fi
+
+# 3. CONCARD_L2_SHIELD: Rogue DHCP Guard, /21 Broadcast Noise Filter & Wi-Fi Management Port Stealth
+L2_SHIELD="$(nvram get cc_l2_shield 2>/dev/null)"
+[ -z "$L2_SHIELD" ] && L2_SHIELD="1"
+
+/sbin/modprobe ebtable_filter 2>/dev/null || true
+/sbin/modprobe ebt_ip 2>/dev/null || true
+if [ -x /bin/ebtables ]; then
+	/bin/ebtables -t filter -N CONCARD_DHCP_GUARD -P RETURN 2>/dev/null || /bin/ebtables -t filter -F CONCARD_DHCP_GUARD 2>/dev/null || true
+	/bin/ebtables -t filter -N CONCARD_MGMT_SHIELD -P RETURN 2>/dev/null || /bin/ebtables -t filter -F CONCARD_MGMT_SHIELD 2>/dev/null || true
+
+	/bin/ebtables -t filter -D FORWARD -j CONCARD_DHCP_GUARD 2>/dev/null || true
+	/bin/ebtables -t filter -D INPUT -j CONCARD_DHCP_GUARD 2>/dev/null || true
+	/bin/ebtables -t filter -D INPUT -j CONCARD_MGMT_SHIELD 2>/dev/null || true
+
+	/bin/ebtables -t filter -I FORWARD 1 -j CONCARD_DHCP_GUARD 2>/dev/null || true
+	/bin/ebtables -t filter -I INPUT 1 -j CONCARD_DHCP_GUARD 2>/dev/null || true
+	/bin/ebtables -t filter -I INPUT 2 -j CONCARD_MGMT_SHIELD 2>/dev/null || true
+
+	# Always block rogue DHCP servers operating over Wi-Fi (UDP sport 67)
+	/bin/ebtables -t filter -A CONCARD_DHCP_GUARD -i ra+ -p IPv4 --ip-proto 17 --ip-sport 67 -j DROP 2>/dev/null || true
+
+	if [ "$L2_SHIELD" != "0" ]; then
+		# Drop noisy L2 broadcast/multicast chatter (NetBIOS 137-138, SSDP 1900, LLMNR 5355) across /21
+		/bin/ebtables -t filter -A CONCARD_DHCP_GUARD -d Multicast -p IPv4 --ip-proto 17 --ip-dport 137:138 -j DROP 2>/dev/null || true
+		/bin/ebtables -t filter -A CONCARD_DHCP_GUARD -d Multicast -p IPv4 --ip-proto 17 --ip-dport 1900 -j DROP 2>/dev/null || true
+		/bin/ebtables -t filter -A CONCARD_DHCP_GUARD -d Multicast -p IPv4 --ip-proto 17 --ip-dport 5355 -j DROP 2>/dev/null || true
+
+		# Stealth AP Web/SSH/TTY management plane from wireless clients (wired eth2 unaffected)
+		/bin/ebtables -t filter -A CONCARD_MGMT_SHIELD -i ra+ -p IPv4 --ip-proto 6 --ip-dport 22 -j DROP 2>/dev/null || true
+		/bin/ebtables -t filter -A CONCARD_MGMT_SHIELD -i ra+ -p IPv4 --ip-proto 6 --ip-dport 80 -j DROP 2>/dev/null || true
+		/bin/ebtables -t filter -A CONCARD_MGMT_SHIELD -i ra+ -p IPv4 --ip-proto 6 --ip-dport 443 -j DROP 2>/dev/null || true
+		/bin/ebtables -t filter -A CONCARD_MGMT_SHIELD -i ra+ -p IPv4 --ip-proto 6 --ip-dport 7681 -j DROP 2>/dev/null || true
+	fi
+fi
+
+# 4. Clean up any stale Guest VLAN bridge before re-evaluating
+if [ -d /sys/class/net/br_guest ]; then
+	ifconfig br_guest down 2>/dev/null || true
+	for p in $(ls /sys/class/net/br_guest/brif 2>/dev/null); do
+		brctl delif br_guest "$p" 2>/dev/null || true
+		case "$p" in
+			eth2.*)
+				ifconfig "$p" down 2>/dev/null || true
+				vconfig rem "$p" 2>/dev/null || true
+				;;
+		esac
+	done
+	brctl delbr br_guest 2>/dev/null || true
+fi
+
+GUEST_ON="$(nvram get rt_guest_enable 2>/dev/null)"
+GUEST_VID="$(nvram get cc_guest_vlan 2>/dev/null)"
+case "$GUEST_VID" in
+	''|*[!0-9]*) GUEST_VID=0 ;;
+esac
+
+if [ "$GUEST_ON" = "1" ] && [ -d /sys/class/net/ra1 ]; then
+	if [ "$GUEST_VID" -ge 2 ] && [ "$GUEST_VID" -le 4094 ]; then
+		vconfig add eth2 "$GUEST_VID" 2>/dev/null || true
+		ifconfig "eth2.${GUEST_VID}" up 2>/dev/null || true
+		brctl delif br0 ra1 2>/dev/null || true
+		brctl addbr br_guest 2>/dev/null || true
+		brctl stp br_guest 0 2>/dev/null || true
+		brctl setfd br_guest 0 2>/dev/null || true
+		brctl addif br_guest "eth2.${GUEST_VID}" 2>/dev/null || true
+		brctl addif br_guest ra1 2>/dev/null || true
+		ifconfig br_guest up 2>/dev/null || true
+		setup_iface_qdisc "eth2.${GUEST_VID}" src
+	else
+		if [ ! -d /sys/class/net/br0/brif/ra1 ]; then
+			brctl addif br0 ra1 2>/dev/null || true
+		fi
+	fi
+fi
+
+[ -x /usr/sbin/concard-rrm-sync ] && /usr/sbin/concard-rrm-sync >/dev/null 2>&1 || true
+
+# 5. Ensure Zero-CPU DHCP Fingerprint daemon & Watchdog are running + refresh LED mode
+if [ -x /usr/sbin/concard-dhcp-fp ]; then
+	FP_PID="$(cat /var/run/concard_dhcp_fp.pid 2>/dev/null)"
+	if [ -z "$FP_PID" ] || ! kill -0 "$FP_PID" 2>/dev/null; then
+		/usr/sbin/concard-dhcp-fp >/dev/null 2>&1 &
+	fi
+fi
+
+if [ -x /usr/sbin/concard-watchdog ]; then
+	WD_PID="$(cat /var/run/concard_watchdog.pid 2>/dev/null)"
+	if [ -z "$WD_PID" ] || ! kill -0 "$WD_PID" 2>/dev/null; then
+		/usr/sbin/concard-watchdog >/dev/null 2>&1 &
+	fi
+fi
+
+killall -SIGHUP detect_link 2>/dev/null || true
+
+exit 0

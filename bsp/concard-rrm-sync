@@ -1,0 +1,69 @@
+#!/bin/sh
+# Concard N9 Zero-Scan Controller-Driven 802.11k Neighbor Report Injector
+# Feeds neighbor BSSIDs & channels directly into MediaTek mt76x2_ap (iwpriv RrmNrList)
+# and stages /tmp/rrm_neighbors.log for the Concard N9 WebAssembly Dashboard
+
+SRC_FILE=""
+if [ -s /etc/n9v1_hybrid_neighbors.txt ]; then
+	SRC_FILE="/etc/n9v1_hybrid_neighbors.txt"
+	cp -f /etc/n9v1_hybrid_neighbors.txt /etc/storage/n9v1_hybrid_neighbors.txt 2>/dev/null || true
+elif [ -s /etc/storage/n9v1_hybrid_neighbors.txt ]; then
+	SRC_FILE="/etc/storage/n9v1_hybrid_neighbors.txt"
+	cp -f /etc/storage/n9v1_hybrid_neighbors.txt /etc/n9v1_hybrid_neighbors.txt 2>/dev/null || true
+fi
+
+[ -d /sys/class/net/ra0 ] || exit 0
+
+RRM_EN="$(nvram get rt_rrm_enable 2>/dev/null)"
+if [ "$RRM_EN" = "0" ]; then
+	iwpriv ra0 set RrmNrList=clear >/dev/null 2>&1 || true
+	: > /tmp/rrm_neighbors.log
+	echo 0 > /tmp/.concard_rrm_count
+	exit 0
+fi
+
+iwpriv ra0 set RrmEnable=1 >/dev/null 2>&1 || true
+[ -d /sys/class/net/ra1 ] && iwpriv ra1 set RrmEnable=1 >/dev/null 2>&1 || true
+
+if [ -z "$SRC_FILE" ]; then
+	: > /tmp/rrm_neighbors.log
+	echo 0 > /tmp/.concard_rrm_count
+	exit 0
+fi
+
+OWN_MAC="$(cat /sys/class/net/ra0/address 2>/dev/null | tr 'A-F' 'a-f' | tr -d ':')"
+
+awk -v own="$OWN_MAC" '
+	NF >= 2 && $1 ~ /^[0-9a-fA-F:]{17}$/ {
+		raw_b = toupper($1);
+		m = tolower($1); gsub(/:/, "", m);
+		ch = int($2);
+		sig = (NF >= 3) ? int($3) : -68;
+		tag = (NF >= 4) ? $4 : "-";
+		if (m != own && length(m) == 12 && ch >= 1 && ch <= 13 && !seen[m]++) {
+			if (cnt < 12) {
+				printf "%s %d %d %s\n", raw_b, ch, sig, tag;
+				cnt++;
+			}
+		}
+	}
+' "$SRC_FILE" > /tmp/rrm_neighbors.log.tmp && mv -f /tmp/rrm_neighbors.log.tmp /tmp/rrm_neighbors.log
+
+NR_PACKED="$(awk '
+	NF >= 2 {
+		m = tolower($1); gsub(/:/, "", m);
+		if (NR > 1) printf ";";
+		printf "%s:%d", m, int($2);
+	}
+' /tmp/rrm_neighbors.log)"
+
+if [ -n "$NR_PACKED" ]; then
+	iwpriv ra0 set "RrmNrList=${NR_PACKED}" >/dev/null 2>&1 || true
+	CNT="$(wc -l < /tmp/rrm_neighbors.log | tr -d ' ')"
+	echo "${CNT:-0}" > /tmp/.concard_rrm_count
+else
+	iwpriv ra0 set RrmNrList=clear >/dev/null 2>&1 || true
+	echo 0 > /tmp/.concard_rrm_count
+fi
+
+exit 0

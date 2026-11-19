@@ -1,0 +1,14 @@
+# Build intermediates & temporary files
+__pycache__/
+*.pyc
+*.log
+*.dat
+*Rollback.web
+node_modules/
+webui/target/
+
+# Keep legacy pre-v2.1 binaries local-only so repository stays lean
+releases/*_v1.*.web
+releases/*_v1.*.trx
+releases/*_v2.0.web
+releases/*_v2.0.trx

@@ -1,0 +1,48 @@
+name: Build Padavan-N9v1 Firmware
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Padavan-N9v1 BSP & Patches
+        uses: actions/checkout@v4
+        with:
+          path: padavan-n9v1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential gawk pkg-config gettext automake autoconf autopoint \
+            libtool-bin bison flex zlib1g-dev libgmp3-dev libmpfr-dev libmpc-dev \
+            texinfo python3 kmod cmake gperf unzip curl wget
+          rustup target add wasm32-unknown-unknown
+
+      - name: Clone Upstream Padavan Tree & Download MIPS Toolchain
+        run: |
+          git clone --depth=1 https://github.com/hanwckf/rt-n56u.git /opt/rt-n56u
+          cd /opt/rt-n56u/toolchain-mipsel
+          ./dl_toolchain.sh
+
+      - name: Apply ConCard N9v1 BSP & Compile Firmware
+        run: |
+          chmod +x "${GITHUB_WORKSPACE}/padavan-n9v1/build_firmware.sh"
+          RT_N56U_ROOT=/opt/rt-n56u "${GITHUB_WORKSPACE}/padavan-n9v1/build_firmware.sh"
+          node "${GITHUB_WORKSPACE}/padavan-n9v1/tools/verify_firmware_image.js" \
+            "${GITHUB_WORKSPACE}/padavan-n9v1/ConCard_Padavan_N9v1_CSB334A-2700_v1.1.web" \
+            "${GITHUB_WORKSPACE}/padavan-n9v1/ConCard_Padavan_N9v1_CSB334A-2700_v1.1.trx"
+
+      - name: Upload Compiled Firmware Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Padavan-N9v1-CSB334A-2700-Firmware
+          path: |
+            padavan-n9v1/ConCard_Padavan_N9v1_CSB334A-2700_v1.1.web
+            padavan-n9v1/ConCard_Padavan_N9v1_CSB334A-2700_v1.1.trx

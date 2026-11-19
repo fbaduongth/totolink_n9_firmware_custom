@@ -1,0 +1,16 @@
+[package]
+name = "n9v1-ap-webui"
+version = "2.1.0"
+edition = "2021"
+description = "Lightweight Rust -> WebAssembly Admin UI for Concard N9 v2.1 (CSB334A-2700)"
+license = "GPL-2.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

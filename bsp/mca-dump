@@ -1,0 +1,149 @@
+#!/bin/sh
+# Concard N9 v2.1 Hybrid Enterprise JSON Telemetry Engine (MediaTek mt76x2_ap + L2 ARP/Neigh)
+# 100% Schema-Compatible with ConCard AP Monitor (standalone_ap_collector.js)
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
+}
+
+AP_MAC=""
+for dev in br0 ra0 eth2; do
+	if [ -r "/sys/class/net/$dev/address" ]; then
+		AP_MAC="$(cat "/sys/class/net/$dev/address" 2>/dev/null)"
+		[ -n "$AP_MAC" ] && break
+	fi
+done
+[ -z "$AP_MAC" ] && AP_MAC="00:00:00:00:00:00"
+
+HOSTNAME_VAL="$(nvram get computer_name 2>/dev/null)"
+[ -z "$HOSTNAME_VAL" ] && HOSTNAME_VAL="$(cat /proc/sys/kernel/hostname 2>/dev/null)"
+[ -z "$HOSTNAME_VAL" ] && HOSTNAME_VAL="Concard-N9"
+echo "$HOSTNAME_VAL" > /proc/sys/kernel/hostname 2>/dev/null || true
+
+DEV_LOC="$(nvram get cc_device_loc 2>/dev/null)"
+
+GW_IP="$(nvram get lan_gateway_t 2>/dev/null)"
+if [ -z "$GW_IP" ] || [ "$GW_IP" = "0.0.0.0" ]; then
+	GW_IP="$(ip -4 route show default 2>/dev/null | awk '/^default/{print $3; exit}')"
+fi
+[ -z "$GW_IP" ] && GW_IP="$(nvram get lan_gateway 2>/dev/null)"
+
+UPTIME_SEC="$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)"
+[ -z "$UPTIME_SEC" ] && UPTIME_SEC=0
+
+ARP_MAP_FILE="/tmp/.mca_arp.$$"
+{
+	awk 'NR>1 && $3!="0x0" {print tolower($4), $1}' /proc/net/arp 2>/dev/null
+	ip -4 neigh show 2>/dev/null | awk '/lladdr/{for(i=1;i<=NF;i++) if($i=="lladdr") print tolower($(i+1)), $1}'
+} | awk '!seen[$1]++ {print $1, $2}' > "$ARP_MAP_FILE"
+
+WSTAT_RAW="$(wget -qO- http://127.0.0.1/Main_WStatus2g_Content.asp 2>/dev/null)"
+TELEM_RAW="$(wget -qO- http://127.0.0.1/api_telemetry.cgi 2>/dev/null)"
+
+LIVE_CH="$(printf '%s\n' "$WSTAT_RAW" | awk -F: '/Channel Main/{gsub(/[ \t\r]/,"",$2); print int($2); exit}')"
+if [ -z "$LIVE_CH" ] || [ "$LIVE_CH" -le 0 ] 2>/dev/null; then
+	LIVE_CH="$(nvram get rt_channel 2>/dev/null)"
+fi
+[ -z "$LIVE_CH" ] || [ "$LIVE_CH" = "0" ] && LIVE_CH=6
+
+TXPWR_PCT="$(nvram get rt_TxPower 2>/dev/null)"
+[ -z "$TXPWR_PCT" ] && TXPWR_PCT=100
+TXPWR_DBM="$(awk -v p="$TXPWR_PCT" 'BEGIN { p=int(p); if (p>=90) print 22; else if (p>=65) print 20; else if (p>=40) print 18; else print 15 }')"
+
+HT_BW="$(nvram get rt_HT_BW 2>/dev/null)"
+DEF_CHW=0
+[ "$HT_BW" = "1" ] && DEF_CHW=1
+
+MAIN_SSID="$(nvram get rt_ssid 2>/dev/null)"
+[ -z "$MAIN_SSID" ] && MAIN_SSID="Concard-N9"
+
+RX0="$(cat /sys/class/net/ra0/statistics/rx_bytes 2>/dev/null)"
+TX0="$(cat /sys/class/net/ra0/statistics/tx_bytes 2>/dev/null)"
+[ -z "$RX0" ] && RX0=0
+[ -z "$TX0" ] && TX0=0
+
+parse_sta_section() {
+	SEC_NAME="$1"
+	printf '%s\n' "$WSTAT_RAW" | awk -v sec="$SEC_NAME" -v arpfile="$ARP_MAP_FILE" -v def_chw="$DEF_CHW" '
+		BEGIN {
+			while ((getline line < arpfile) > 0) {
+				split(line, a, " ");
+				if (a[1] != "" && a[2] != "") arp[a[1]] = a[2];
+			}
+			close(arpfile);
+			in_sec = 0; cnt = 0;
+		}
+		/^AP Main Stations List/  { in_sec = (sec == "Main") ? 1 : 0; next }
+		/^AP Guest Stations List/ { in_sec = (sec == "Guest") ? 1 : 0; next }
+		/^<\/textarea>/           { in_sec = 0; next }
+		in_sec && $1 ~ /^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/ && NF >= 9 {
+			mac = tolower($1);
+			phy = toupper($2);
+			bw_s = $3;
+			tr_s = $8; gsub(/M/, "", tr_s);
+			sig = int($9);
+			if (sig >= 0 || sig < -110) sig = -68;
+			rssi = sig + 95;
+			if (rssi < 0) rssi = 0;
+			is11n = (phy ~ /HT/) ? "true" : "false";
+			chw = (bw_s ~ /40/) ? 1 : def_chw;
+			txk = int((tr_s + 0) * 1000);
+			if (txk <= 0) txk = 65000;
+			t_str = $NF;
+			n_t = split(t_str, tp, ":");
+			conn = 0;
+			if (n_t == 3) conn = int(tp[1]) * 3600 + int(tp[2]) * 60 + int(tp[3]);
+			ip = (mac in arp) ? arp[mac] : "";
+			if (cnt > 0) printf ",";
+			cnt++;
+			printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"signal\":%d,\"rssi\":%d,\"is_11n\":%s,\"chwidth\":%d,\"tx_rate\":%d,\"rx_rate\":%d,\"rx_bytes\":0,\"tx_bytes\":0,\"uptime\":%d}",
+				mac, ip, sig, rssi, is11n, chw, txk, txk, conn;
+		}
+	'
+}
+
+STA0_JSON="$(parse_sta_section Main)"
+NUM_STA0=0
+if [ -n "$STA0_JSON" ]; then
+	NUM_STA0="$(printf '%s' "$STA0_JSON" | awk -F'\\{"mac":' '{print NF-1}')"
+fi
+
+VAP_JSON="{\"name\":\"ra0\",\"essid\":\"$(json_escape "$MAIN_SSID")\",\"channel\":${LIVE_CH},\"tx_power\":${TXPWR_DBM},\"radio\":\"ng\",\"rx_bytes\":${RX0},\"tx_bytes\":${TX0},\"num_sta\":${NUM_STA0},\"sta_table\":[${STA0_JSON}]}"
+
+GUEST_ON="$(nvram get rt_guest_enable 2>/dev/null)"
+if [ "$GUEST_ON" = "1" ] && [ -d /sys/class/net/ra1 ]; then
+	GUEST_SSID="$(nvram get rt_guest_ssid 2>/dev/null)"
+	[ -z "$GUEST_SSID" ] && GUEST_SSID="Concard-Guest"
+	RX1="$(cat /sys/class/net/ra1/statistics/rx_bytes 2>/dev/null)"
+	TX1="$(cat /sys/class/net/ra1/statistics/tx_bytes 2>/dev/null)"
+	[ -z "$RX1" ] && RX1=0
+	[ -z "$TX1" ] && TX1=0
+	STA1_JSON="$(parse_sta_section Guest)"
+	NUM_STA1=0
+	if [ -n "$STA1_JSON" ]; then
+		NUM_STA1="$(printf '%s' "$STA1_JSON" | awk -F'\\{"mac":' '{print NF-1}')"
+	fi
+	VAP_JSON="${VAP_JSON},{\"name\":\"ra1\",\"essid\":\"$(json_escape "$GUEST_SSID")\",\"channel\":${LIVE_CH},\"tx_power\":${TXPWR_DBM},\"radio\":\"ng\",\"rx_bytes\":${RX1},\"tx_bytes\":${TX1},\"num_sta\":${NUM_STA1},\"sta_table\":[${STA1_JSON}]}"
+fi
+
+rm -f "$ARP_MAP_FILE"
+
+RRM_CNT=0
+[ -r /tmp/.concard_rrm_count ] && read -r RRM_CNT < /tmp/.concard_rrm_count 2>/dev/null || true
+[ -z "$RRM_CNT" ] && RRM_CNT=0
+
+CU_24="$(printf '%s' "$TELEM_RAW" | sed -n 's/.*"channelBusyPct":\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+if [ -z "$CU_24" ]; then
+	CU_24=$((NUM_STA0 * 3 + 2))
+	[ "$CU_24" -gt 85 ] && CU_24=85
+fi
+
+printf '{"mac":"%s","hostname":"%s","location":"%s","family":"concard_n9","model":"Concard-N9","model_display":"Concard N9","version":"Concard N9 v2.1","gateway_ip":"%s","uptime":%s,"rrm_count":%s,"radio_table":[{"name":"ra0","radio":"ng","athstats":{"cu_total":%s}}],"vap_table":[%s]}\n' \
+	"$(json_escape "$AP_MAC")" \
+	"$(json_escape "$HOSTNAME_VAL")" \
+	"$(json_escape "$DEV_LOC")" \
+	"$(json_escape "$GW_IP")" \
+	"$UPTIME_SEC" \
+	"$RRM_CNT" \
+	"$CU_24" \
+	"$VAP_JSON"

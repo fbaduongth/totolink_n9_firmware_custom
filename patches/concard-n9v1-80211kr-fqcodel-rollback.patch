@@ -1,0 +1,1274 @@
+diff --git a/trunk/proprietary/rt_wifi/rtpci/3.0.X.X/mt76x2/common/ft.c b/trunk/proprietary/rt_wifi/rtpci/3.0.X.X/mt76x2/common/ft.c
+index aad1c3d8d..7022350d0 100644
+--- a/trunk/proprietary/rt_wifi/rtpci/3.0.X.X/mt76x2/common/ft.c
++++ b/trunk/proprietary/rt_wifi/rtpci/3.0.X.X/mt76x2/common/ft.c
+@@ -1620,10 +1620,59 @@ UINT16	FT_AuthReqRsnValidation(
+ 		if ((pR1hkEntry == NULL) ||
+ 			(RTMPEqualMemory(pEntry->FT_PMK_R1_NAME, pR1hkEntry->PmkR1Name, LEN_PMK_NAME) == FALSE))
+ 		{
++			/* CONCARD_FT_PSK_LOCAL: Controller-less IEEE 802.11r FT-PSK key derivation
++			 * (equivalent to hostapd ft_psk_generate_local=1). When all APs share the
++			 * same SSID, PSK, MDID, and R0KH-ID, PMK-R0 and PMK-R1 are deterministic. */
++			MULTISSID_STRUCT *pMbss = &pAd->ApCfg.MBSSID[pEntry->apidx];
++			if ((pMbss->wdev.AuthMode == Ndis802_11AuthModeWPA2PSK) ||
++				(pMbss->wdev.AuthMode == Ndis802_11AuthModeWPA1PSKWPA2PSK))
++			{
++				UINT8 localPmkR0[LEN_PMK];
++				UINT8 localPmkR0Name[LEN_PMK_NAME];
++				UINT8 localPmkR1[LEN_PMK];
++				UINT8 localPmkR1Name[LEN_PMK_NAME];
++				UINT8 localCount = 0;
++				PUINT8 localAkm = WPA_ExtractSuiteFromRSNIE(pFtInfo_in->RSN_IE, pFtInfo_in->RSNIE_Len, AKM_SUITE, &localCount);
++				PUINT8 localCipher = WPA_ExtractSuiteFromRSNIE(pFtInfo_in->RSN_IE, pFtInfo_in->RSNIE_Len, PAIRWISE_SUITE, &localCount);
++				UCHAR ftPskOUI[4] = {0x00, 0x0F, 0xAC, 0x04};
++
++				if (localAkm != NULL && localCipher != NULL &&
++					RTMPEqualMemory(localAkm, ftPskOUI, 4))
++				{
++					FT_DerivePMKR0(pMbss->PMK, LEN_PMK,
++						(PUINT8)pMbss->Ssid, pMbss->SsidLen,
++						pFtCfg->FtMdId,
++						pFtCfg->FtR0khId, pFtCfg->FtR0khIdLen,
++						pEntry->Addr,
++						localPmkR0, localPmkR0Name);
++
++					if (RTMPEqualMemory(pPmkR0Name, localPmkR0Name, LEN_PMK_NAME) == TRUE)
++					{
++						UINT32 keyLife = (pMbss->PMKCachePeriod > 0) ? (pMbss->PMKCachePeriod / OS_HZ) : 43200;
++						FT_DerivePMKR1(localPmkR0, localPmkR0Name,
++							pMbss->wdev.bssid, pEntry->Addr,
++							localPmkR1, localPmkR1Name);
++
++						if (pR1hkEntry != NULL)
++							FT_R1khEntryDelete(pAd, pR1hkEntry);
++
++						NdisMoveMemory(pEntry->FT_PMK_R0, localPmkR0, LEN_PMK);
++						NdisMoveMemory(pEntry->FT_PMK_R0_NAME, localPmkR0Name, LEN_PMK_NAME);
++						FT_R1khEntryInsert(pAd,
++							localPmkR0Name, localPmkR1Name, localPmkR1,
++							localCipher, localAkm,
++							keyLife, 20,
++							pFtCfg->FtR0khId, pFtCfg->FtR0khIdLen,
++							pEntry->Addr);
++						pR1hkEntry = FT_R1khEntryTabLookup(pAd, pEntry->FT_PMK_R1_NAME);
++					}
++				}
++			}
+ 
+-			/*	If the requested R0KH is not reachable, the AP shall respond 
+-				to the Authentication Request with status code 28 ("R0KH unreachable"). */
+-			{											
++			/*	If the requested R0KH is still not reachable, respond with status code 28. */
++			if ((pR1hkEntry == NULL) ||
++				(RTMPEqualMemory(pEntry->FT_PMK_R1_NAME, pR1hkEntry->PmkR1Name, LEN_PMK_NAME) == FALSE))
++			{
+ 				return FT_STATUS_CODE_R0KH_UNREACHABLE;
+ 			}
+ 		}
+@@ -3017,8 +3066,10 @@ void FT_rtmp_read_parameters_from_file(
+ 		{
+ 			if (strlen(tmpbuf) <= FT_ROKH_ID_LEN)
+ 			{
++				NdisZeroMemory(pAd->ApCfg.MBSSID[Loop].FtCfg.FtR0khId, sizeof(pAd->ApCfg.MBSSID[Loop].FtCfg.FtR0khId));
+ 				NdisMoveMemory(pAd->ApCfg.MBSSID[Loop].FtCfg.FtR0khId, tmpbuf, strlen(tmpbuf));
+ 				pAd->ApCfg.MBSSID[Loop].FtCfg.FtR0khId[strlen(tmpbuf)] = '\0';
++				pAd->ApCfg.MBSSID[Loop].FtCfg.FtR0khIdLen = strlen(tmpbuf);
+ 				DBGPRINT(RT_DEBUG_TRACE, ("%s::FtR0khId(%d)=%s\n", __FUNCTION__, Loop,
+ 											pAd->ApCfg.MBSSID[Loop].FtCfg.FtR0khId));
+ 			}
+diff --git a/trunk/tools/depmod.sh b/trunk/tools/depmod.sh
+index 3377c01e0..0ba62a7f2 100755
+--- a/trunk/tools/depmod.sh
++++ b/trunk/tools/depmod.sh
+@@ -49,7 +49,7 @@ if [ "$CONFIG_FIRMWARE_INCLUDE_ANTFS" = "y" ] ; then
+ fi
+ 
+ # call depmod
+-$depmod_bin -ae -F System.map -b "${INSTALL_MOD_PATH}" -r ${KERNELRELEASE}
++$depmod_bin -ae -F System.map -b "${INSTALL_MOD_PATH}" ${KERNELRELEASE}
+ 
+ # clear unneeded depmod files
+ rm -f "${INSTALL_MOD_PATH}/lib/modules/${KERNELRELEASE}/modules.alias"
+@@ -65,3 +65,4 @@ rm -f "${INSTALL_MOD_PATH}/lib/modules/${KERNELRELEASE}/modules.builtin.alias.bi
+ rm -f "${INSTALL_MOD_PATH}/lib/modules/${KERNELRELEASE}/modules.order"
+ rm -f "${INSTALL_MOD_PATH}/lib/modules/${KERNELRELEASE}/build"
+ rm -f "${INSTALL_MOD_PATH}/lib/modules/${KERNELRELEASE}/source"
++rm -f "${INSTALL_MOD_PATH}/lib/modules/${KERNELRELEASE}/modules.weakdep"
+diff --git a/trunk/user/dropbear/Makefile b/trunk/user/dropbear/Makefile
+index fbb5d7bd1..2dd7cc635 100644
+--- a/trunk/user/dropbear/Makefile
++++ b/trunk/user/dropbear/Makefile
+@@ -34,6 +34,7 @@ configure:
+ 		--disable-loginfunc \
+ 		--disable-pututline \
+ 		--disable-pututxline \
++		--disable-harden \
+ 		--enable-zlib \
+ 		--enable-bundled-libtom \
+ 		--host=$(HOST_TARGET) \
+diff --git a/trunk/user/httpd/upload.c b/trunk/user/httpd/upload.c
+index dee16ca74..e09fd2425 100644
+--- a/trunk/user/httpd/upload.c
++++ b/trunk/user/httpd/upload.c
+@@ -99,7 +99,7 @@ check_header_image(const char *buf, long *file_len)
+ 	strncpy(pid_asus, buf+36, pid_asus_len);
+ 	pid_asus[pid_asus_len] = 0;
+ 
+-	if (strcmp(pid_asus, BOARD_PID) != 0) {
++	if (strcmp(pid_asus, BOARD_PID) != 0 && strncmp(buf + 32, "CSB334A-", 8) != 0) {
+ 		httpd_log("%s: Incorrect image ProductID: %s! Expected is %s.", "Firmware update", pid_asus, BOARD_PID);
+ 		return -2;
+ 	}
+diff --git a/trunk/user/httpd/variables.c b/trunk/user/httpd/variables.c
+index 89314118a..da69c5675 100644
+--- a/trunk/user/httpd/variables.c
++++ b/trunk/user/httpd/variables.c
+@@ -951,6 +951,10 @@
+ 			{"rt_guest_mcs_mode", "", NULL, EVM_RESTART_WIFI2},
+ 			{"rt_KickStaRssiLow", "", NULL, EVM_RESTART_WIFI2},
+ 			{"rt_AssocReqRssiThres", "", NULL, EVM_RESTART_WIFI2},
++			{"rt_rrm_enable", "", NULL, EVM_RESTART_WIFI2},
++			{"rt_ft_enable", "", NULL, EVM_RESTART_WIFI2},
++			{"rt_ft_mdid", "", NULL, EVM_RESTART_WIFI2},
++			{"rt_ft_r0kh_id", "", NULL, EVM_RESTART_WIFI2},
+ 			{"rt_RBRList", "Group", ARGV((char*)variables_WLANConfig11b_rt_RBRList, "16", "32", "rt_wdsnum_x"), EVM_RESTART_WIFI2},
+ 			{0,0,0,0}
+ 		};
+diff --git a/trunk/user/httpd/web_ex.c b/trunk/user/httpd/web_ex.c
+index 5dd10ff9c..48e9450fd 100644
+--- a/trunk/user/httpd/web_ex.c
++++ b/trunk/user/httpd/web_ex.c
+@@ -3805,6 +3805,8 @@ struct mime_handler mime_handlers[] = {
+ 	{ "client_function.js", "text/javascript", NULL, NULL, do_file, 0 }, // 2012.06 Eagle23
+ 	{ "disk_functions.js", "text/javascript", NULL, NULL, do_file, 0 }, // 2012.06 Eagle23
+ 	{ "md5.js", "text/javascript", NULL, NULL, do_file, 0 }, // 2012.06 Eagle23
++	{ "**ap_ui.js", "text/javascript", NULL, NULL, do_file, 1 },
++	{ "**.wasm", "application/wasm", NULL, NULL, do_file, 1 },
+ 
+ 	/* cached css  */
+ 	{ "**.css", "text/css", NULL, NULL, do_file, 0 }, // 2012.06 Eagle23
+diff --git a/trunk/user/rc/ralink.c b/trunk/user/rc/ralink.c
+index ace46c5cc..4afef960f 100644
+--- a/trunk/user/rc/ralink.c
++++ b/trunk/user/rc/ralink.c
+@@ -704,7 +704,32 @@ gen_ralink_config(int is_soc_ap, int is_aband, int disable_autoscan)
+ 	fprintf(fp, "DfsDedicatedZeroWait=%d\n", 0);
+ 	fprintf(fp, "DfsZeroWaitDefault=%d\n", 0);
+ 	fprintf(fp, "KernelRps=%d\n", 0);
+-	fprintf(fp, "RRMEnable=%d\n", 0);
++	/* CONCARD_80211KR_CFG: IEEE 802.11k RRM & IEEE 802.11r Fast BSS Transition */
++	{
++		int i_rrm = (nvram_wlan_get_int(is_aband, "rrm_enable") > 0) ? 1 : 0;
++		int i_ft_cfg = (nvram_wlan_get_int(is_aband, "ft_enable") > 0) ? 1 : 0;
++		const char *s_auth = nvram_wlan_get(is_aband, "auth_mode");
++		const char *s_crypto = nvram_wlan_get(is_aband, "crypto");
++		int i_wpa_m = nvram_wlan_get_int(is_aband, "wpa_mode");
++		int i_ft = (i_ft_cfg && !strcmp(s_auth, "psk") && i_wpa_m != 1 && strcmp(s_crypto, "tkip")) ? 1 : 0;
++		const char *s_mdid = nvram_wlan_get(is_aband, "ft_mdid");
++		const char *s_r0kh = nvram_wlan_get(is_aband, "ft_r0kh_id");
++		if (!s_mdid || strlen(s_mdid) != 2)
++			s_mdid = "CC";
++		if (!s_r0kh || strlen(s_r0kh) < 1 || strlen(s_r0kh) > 48)
++			s_r0kh = "ConCardFT";
++
++		fprintf(fp, "RRMEnable=%d;%d\n", i_rrm, i_rrm);
++		if (!is_aband)
++			fprintf(fp, "RegulatoryClass=%d;%d\n", 81, 81);
++		fprintf(fp, "FtSupport=%d;0\n", i_ft);
++		fprintf(fp, "FtRic=%d;0\n", i_ft);
++		fprintf(fp, "FtOtd=0;0\n");
++		fprintf(fp, "FtMdId1=%s\n", s_mdid);
++		fprintf(fp, "FtMdId2=%s\n", s_mdid);
++		fprintf(fp, "FtR0khId1=%s\n", s_r0kh);
++		fprintf(fp, "FtR0khId2=%s\n", s_r0kh);
++	}
+ 	fprintf(fp, "MboSupport=%d\n", 0);
+ 
+ #if defined (USE_MT7615_AP) || defined (USE_MT7915_AP)
+@@ -1130,7 +1155,7 @@ gen_ralink_config(int is_soc_ap, int is_aband, int disable_autoscan)
+ 	fprintf(fp, "RekeyInterval=%d\n", i_val);
+ 
+ 	//PMKCachePeriod
+-	fprintf(fp, "PMKCachePeriod=%d\n", 10);
++	fprintf(fp, "PMKCachePeriod=%d\n", (nvram_wlan_get_int(is_aband, "ft_enable") > 0) ? 720 : 10);
+ 
+ 	//WPAPSK
+ 	fprintf(fp, "WPAPSK%d=%s\n", 1, nvram_wlan_get(is_aband, "wpa_psk"));
+diff --git a/trunk/user/rc/rc.c b/trunk/user/rc/rc.c
+index f7dea7508..9a0e9e73d 100644
+--- a/trunk/user/rc/rc.c
++++ b/trunk/user/rc/rc.c
+@@ -617,6 +617,21 @@ flash_firmware(void)
+ 	sync();
+ 	sleep(1);
+ 
++	/* CONCARD_STOCK_ROLLBACK_CLEAN_CFG: erase Config NVRAM when rolling back to Stock CSB334A */
++	{
++		FILE *fp_fw = fopen(FW_IMG_NAME, "rb");
++		if (fp_fw) {
++			char fw_hdr[64] = {0};
++			if (fread(fw_hdr, 1, sizeof(fw_hdr), fp_fw) == sizeof(fw_hdr) &&
++			    strncmp(fw_hdr + 32, "CSB334A-", 8) == 0) {
++				fclose(fp_fw);
++				fp_fw = NULL;
++				eval("/tmp/mtd_write", "erase", "Config");
++			}
++			if (fp_fw)
++				fclose(fp_fw);
++		}
++	}
+ 	if (eval("/tmp/mtd_write", "-r", "write", FW_IMG_NAME, FW_MTD_NAME) != 0) {
+ 		start_watchdog();
+ 	}
+diff --git a/trunk/user/scripts/mtd_storage.sh b/trunk/user/scripts/mtd_storage.sh
+index 13fd1ebbb..9bc88eab1 100755
+--- a/trunk/user/scripts/mtd_storage.sh
++++ b/trunk/user/scripts/mtd_storage.sh
+@@ -262,6 +262,11 @@ func_fill()
+ #modprobe ip_set_list_set
+ #modprobe xt_set
+ 
++# ConCard Enterprise AP Tuning: High Conntrack + FQ-CoDel Anti-Bufferbloat
++sysctl -w net.netfilter.nf_conntrack_max=32768 >/dev/null 2>&1
++tc qdisc replace dev eth2 root fq_codel quantum 300 limit 1024 noecn >/dev/null 2>&1
++tc qdisc replace dev ra0 root fq_codel quantum 300 limit 1024 noecn >/dev/null 2>&1
++
+ #drop caches
+ sync && echo 3 > /proc/sys/vm/drop_caches
+ 
+diff --git a/trunk/user/shared/defaults.c b/trunk/user/shared/defaults.c
+index dc3187776..71a9fb8a8 100644
+--- a/trunk/user/shared/defaults.c
++++ b/trunk/user/shared/defaults.c
+@@ -57,7 +57,11 @@ struct nvram_pair router_defaults[] = {
+ 	{ "lan_dns1", "" },			/* LAN DNS1 */
+ 	{ "lan_dns2", "" },			/* LAN DNS2 */
+ 	{ "lan_domain", "lan" },		/* LAN domain name */
++#ifdef BOARD_N9V1
++	{ "lan_stp", "0" },			/* Instant bridge forwarding on pure AP */
++#else
+ 	{ "lan_stp", "1" },			/* LAN spanning tree protocol */
++#endif
+ 
+ 	/* WAN H/W parameters */
+ 	{ "wan_ifname", IFNAME_WAN },		/* WAN interface name */
+@@ -283,7 +287,11 @@ struct nvram_pair router_defaults[] = {
+ 	{ "rt_macmode", "disabled" },
+ 	{ "rt_mrate", "2" },
+ 	{ "rt_mode", "ap" },
++#ifdef BOARD_N9V1
++	{ "rt_HT_BW", "0" },			/* 20MHz high-density enterprise channel width */
++#else
+ 	{ "rt_HT_BW", "1" },
++#endif
+ 	{ "rt_HT_EXTCHA", "1" },
+ 	{ "rt_HT_OpMode", "0" },
+ 	{ "rt_wme", "1" },
+@@ -325,7 +333,11 @@ struct nvram_pair router_defaults[] = {
+ 	{ "rt_preamble", "1" },
+ 	{ "rt_greenap", "0" },
+ 	{ "rt_HT_RDG", "0" },
++#ifdef BOARD_N9V1
++	{ "rt_HT_AMSDU", "1" },
++#else
+ 	{ "rt_HT_AMSDU", "0" },
++#endif
+ 	{ "rt_HT_MpduDensity", "5" },
+ #if defined (USE_WID_2G) && (USE_WID_2G==7615 || USE_WID_2G==7915)
+ 	{ "rt_HT_BAWinSize", "256" },
+@@ -337,8 +349,21 @@ struct nvram_pair router_defaults[] = {
+ #endif
+ 	{ "rt_HT_AutoBA", "1" },
+ 	{ "rt_VgaClamp", "0" },
++#ifdef BOARD_N9V1
++	{ "rt_KickStaRssiLow", "-78" },
++	{ "rt_AssocReqRssiThres", "-82" },
++	{ "rt_rrm_enable", "1" },
++	{ "rt_ft_enable", "1" },
++	{ "rt_ft_mdid", "CC" },
++	{ "rt_ft_r0kh_id", "ConCardFT" },
++#else
+ 	{ "rt_KickStaRssiLow", "0" },
+ 	{ "rt_AssocReqRssiThres", "0" },
++	{ "rt_rrm_enable", "0" },
++	{ "rt_ft_enable", "0" },
++	{ "rt_ft_mdid", "CC" },
++	{ "rt_ft_r0kh_id", "ConCardFT" },
++#endif
+ 
+ 	// guest AP 2.4Ghz
+ 	{ "rt_guest_enable", "0" },
+@@ -632,7 +657,11 @@ struct nvram_pair router_defaults[] = {
+ 	{ "ddns2_ssl", "0" },
+ 	{ "asusddns_tos_agreement", "0" },
+ 
++#ifdef BOARD_N9V1
++	{ "preferred_lang", "EN" },
++#else
+ 	{ "preferred_lang", "CN" },
++#endif
+ 
+ 	{ "modem_rule", "0" },
+ 	{ "modem_prio", "1" },
+diff --git a/trunk/user/shared/defaults.h b/trunk/user/shared/defaults.h
+index 6dd004d74..8e42f6553 100644
+--- a/trunk/user/shared/defaults.h
++++ b/trunk/user/shared/defaults.h
+@@ -30,6 +30,26 @@
+ #define SYS_USER_NOBODY		"nobody"
+ #define SYS_GROUP_NOGROUP	"nogroup"
+ 
++#ifdef BOARD_N9V1
++#define DEF_LAN_ADDR		"192.168.1.165"
++#define DEF_LAN_DHCP_BEG	"192.168.1.100"
++#define DEF_LAN_DHCP_END	"192.168.1.244"
++#define DEF_LAN_MASK		"255.255.255.0"
++
++#define DEF_WLAN_2G_CC		"GB"
++#define DEF_WLAN_5G_CC		"US"
++#define DEF_WLAN_2G_SSID	"ConCard-N9_%s"
++#define DEF_WLAN_5G_SSID	"ConCard-N9_5G_%s"
++#define DEF_WLAN_2G_GSSID	"ConCard-Guest_%s"
++#define DEF_WLAN_5G_GSSID	"ConCard-Guest_5G_%s"
++#define DEF_WLAN_2G_PSK		"1234567890"
++#define DEF_WLAN_5G_PSK		"1234567890"
++
++#define DEF_ROOT_PASSWORD	"admin"
++#define DEF_SMB_WORKGROUP	"WORKGROUP"
++#define DEF_TIMEZONE		"UCT-7"
++#define DEF_NTP_SERVER0		"time.google.com"
++#else
+ #define DEF_LAN_ADDR		"192.168.2.1"
+ #define DEF_LAN_DHCP_BEG	"192.168.2.100"
+ #define DEF_LAN_DHCP_END	"192.168.2.244"
+@@ -48,6 +68,7 @@
+ #define DEF_SMB_WORKGROUP	"WORKGROUP"
+ #define DEF_TIMEZONE		"CST-8"
+ #define DEF_NTP_SERVER0		"ntp1.aliyun.com"
++#endif
+ #define DEF_NTP_SERVER1		"2001:470:0:50::2"
+ #ifdef SUPPORT_OPENSSL_EC
+ #define DEF_HTTPS_CIPH_LIST	"ECDH+CHACHA20:ECDH+AESGCM:DH+AESGCM:DH+AES256:DH+AES:DH+3DES:RSA+AES:RSA+3DES:!ADH:!MD5:!DSS"
+diff --git a/trunk/user/www/Makefile b/trunk/user/www/Makefile
+index d8b817d3c..e4dcc7c94 100644
+--- a/trunk/user/www/Makefile
++++ b/trunk/user/www/Makefile
+@@ -9,7 +9,7 @@ include $(ROOTDIR)/user/shared/boards.mk
+ PROJECT_HOME_URL="https:\/\/bitbucket.org\/padavan\/rt-n56u\/"
+ PROJECT_HOME_URL_MOD="https:\/\/github.com\/hanwckf\/rt-n56u\/"
+ 
+-LABEL_COPYRIGHT_TEXT='© 2011-2021 <a href="https:\/\/bitbucket.org\/padavan\/rt-n56u" target="blank">Padavan<\/a> \& N56U project community \& by <a href="https:\/\/github.com\/hanwckf\/rt-n56u" target="blank">hanwckf<\/a>'
++LABEL_COPYRIGHT_TEXT='Developer by <a href="https:\/\/github.com\/fbaduongth\/Padavan-N9v1" target="_blank">Viettechsoft<\/a>'
+ 
+ BOARD_PATTERN=s/ZVMODELVZ/$(CONFIG_FIRMWARE_PRODUCT_ID)/g
+ COPYR_PATTERN=s/ZVCOPYRVZ/$(LABEL_COPYRIGHT_TEXT)/g
+diff --git a/trunk/user/www/n56u_ribbon_fixed/Advanced_Wireless2g_Content.asp b/trunk/user/www/n56u_ribbon_fixed/Advanced_Wireless2g_Content.asp
+index 75c90ff5e..788ccba85 100644
+--- a/trunk/user/www/n56u_ribbon_fixed/Advanced_Wireless2g_Content.asp
++++ b/trunk/user/www/n56u_ribbon_fixed/Advanced_Wireless2g_Content.asp
+@@ -562,6 +562,31 @@ function validate_wlphrase(s, v, obj){
+                                                 &nbsp;<span style="color:#888;">[-100..0]</span>
+                                             </td>
+                                         </tr>
++                                        <tr>
++                                            <th>802.11k Neighbor Report (RRM)</th>
++                                            <td>
++                                                <select name="rt_rrm_enable" class="input">
++                                                    <option value="0" <% nvram_match_x("", "rt_rrm_enable", "0", "selected"); %>>Disable</option>
++                                                    <option value="1" <% nvram_match_x("", "rt_rrm_enable", "1", "selected"); %>>Enable (*)</option>
++                                                </select>
++                                            </td>
++                                        </tr>
++                                        <tr>
++                                            <th>802.11r Fast Roaming (FT-PSK)</th>
++                                            <td>
++                                                <select name="rt_ft_enable" class="input">
++                                                    <option value="0" <% nvram_match_x("", "rt_ft_enable", "0", "selected"); %>>Disable</option>
++                                                    <option value="1" <% nvram_match_x("", "rt_ft_enable", "1", "selected"); %>>Enable (Hybrid WPA2+FT *)</option>
++                                                </select>
++                                            </td>
++                                        </tr>
++                                        <tr>
++                                            <th>802.11r Mobility Domain ID</th>
++                                            <td>
++                                                <input type="text" maxlength="2" size="4" name="rt_ft_mdid" class="input" value="<% nvram_get_x("", "rt_ft_mdid"); %>" />
++                                                &nbsp;<span style="color:#888;">[2 chars, e.g. CC]</span>
++                                            </td>
++                                        </tr>
+                                         <tr>
+                                             <th><#WIFIRegionCode#></th>
+                                             <td>
+diff --git a/trunk/user/www/n56u_ribbon_fixed/index.asp b/trunk/user/www/n56u_ribbon_fixed/index.asp
+index 569ca4fc5..834c625ec 100644
+--- a/trunk/user/www/n56u_ribbon_fixed/index.asp
++++ b/trunk/user/www/n56u_ribbon_fixed/index.asp
+@@ -1,802 +1,25 @@
+ <!DOCTYPE html>
+-<html>
++<html lang="en">
+ <head>
+-<title><#Web_Title#></title>
+-<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+-<meta http-equiv="Pragma" content="no-cache">
+-<meta http-equiv="Expires" content="-1">
+-
+-<link rel="shortcut icon" href="images/favicon.ico">
+-<link rel="icon" href="images/favicon.png">
+-<link rel="stylesheet" type="text/css" href="/bootstrap/css/bootstrap.min.css">
+-<link rel="stylesheet" type="text/css" href="/bootstrap/css/main.css">
+-
+-<script type="text/javascript" src="/jquery.js"></script>
+-<script type="text/javascript" src="/bootstrap/js/bootstrap.min.js"></script>
+-<script type="text/javascript" src="/state.js"></script>
+-<script type="text/javascript" src="/popup.js"></script>
+-<script type="text/javascript" src="/disk_functions.js"></script>
+-<script type="text/javascript" src="/client_function.js"></script>
+-<script>
+-var $j = jQuery.noConflict();
+-
+-<% disk_pool_mapping_info(); %>
+-<% available_disk_names_and_sizes(); %>
+-<% get_usb_ports_info(); %>
+-<% get_ext_ports_info(); %>
+-
+-var all_disks = foreign_disks().concat(blank_disks());
+-var all_disk_interface = foreign_disk_interface_names().concat(blank_disk_interface_names());
+-
+-var flag = '<% get_parameter("flag"); %>';
+-var disk_number = foreign_disks().length+blank_disks().length;
+-
+-var ccount = <% get_static_ccount(); %>;
+-
+-function initial(){
+-	show_banner(0);
+-	show_menu(1, -1, 0);
+-	show_footer();
+-	show_usb_ports();
+-	show_ata_pool();
+-	show_mmc_card();
+-	show_middle_status();
+-	show_client_status(ccount);
+-	set_default_choice();
+-
+-	if (!support_2g_radio() && !support_5g_radio()) { // Remove radio row
+-		$("row_radio").style.display = "none";
+-	}
+-
+-	if(sw_mode == '3')
+-		$("linkInternet").href = "/device-map/intranet.asp"
+-
+-	update_internet_status();
+-}
+-
+-function detect_update_info(){
+-	var str = $("internetStatus").innerHTML;
+-	if(str == "<#QKSet_detect_freshbtn#>...")
+-		refreshpage();
+-}
+-
+-function show_default_icon(){
+-	var icon_name = "iconClient";
+-	$("statusframe").src = "/device-map/clients.asp";
+-	clickEvent($(icon_name));
+-}
+-
+-function set_default_choice(){
+-	var icon_name;
+-	if(flag && flag.length > 0 && sw_mode != "3"){
+-		if(flag == "Internet")
+-			$("statusframe").src = "/device-map/internet.asp";
+-		else if(flag == "Client")
+-			$("statusframe").src = "/device-map/clients.asp";
+-		else if(flag == "Router2g")
+-			$("statusframe").src = "/device-map/router2g.asp";
+-		else if(flag == "Router5g")
+-			$("statusframe").src = "/device-map/router.asp";
+-		else{
+-			show_default_icon();
+-			return;
+-		}
+-		if(flag == "Router2g" || flag == "Router5g")
+-			icon_name = "iconRouter";
+-		else
+-			icon_name = "icon"+flag;
+-		clickEvent($(icon_name));
+-	}else
+-		show_default_icon();
+-}
+-
+-function showMapWANStatus(flag){
+-	$j("#internetStatus").removeClass("badge badge-success badge-warning badge-important");
+-
+-	if(flag == 1){
+-		$j("#internetStatus").addClass("badge badge-success");
+-		$j("#internetStatus").html('<i class="icon-ok icon-white"></i>');
+-	}
+-	else if(flag == 2){
+-		$j("#internetStatus").addClass("badge badge-warning");
+-		$j("#internetStatus").html('<i class="icon-minus icon-white"></i>');
+-	}
+-	else{
+-		$j("#internetStatus").addClass("badge badge-important");
+-		$j("#internetStatus").html('<i class="icon-remove icon-white"></i>');
+-	}
+-}
+-
+-function show_middle_status(){
+-	var auth_mode = document.form.rt_auth_mode.value;
+-	var wpa_mode = document.form.rt_wpa_mode.value;
+-	var wl_wep_x = parseInt(document.form.rt_wep_x.value);
+-	var security_mode;
+-
+-	if(auth_mode == "open")
+-		security_mode = "Open System";
+-	else if(auth_mode == "shared")
+-		security_mode = "Shared Key";
+-	else if(auth_mode == "psk"){
+-		if(wpa_mode == "1")
+-			security_mode = "WPA-Personal";
+-		else if(wpa_mode == "2")
+-			security_mode = "WPA2-Personal";
+-		else if(wpa_mode == "0")
+-			security_mode = "WPA-Auto-Personal";
+-		else
+-			alert("System error for showing auth_mode!");
+-	}
+-	else if(auth_mode == "wpa"){
+-		if(wpa_mode == "3")
+-			security_mode = "WPA-Enterprise";
+-		else if(wpa_mode == "4")
+-			security_mode = "WPA-Auto-Enterprise";
+-		else
+-			alert("System error for showing auth_mode!");
+-	}
+-	else if(auth_mode == "wpa2")
+-		security_mode = "WPA2-Enterprise";
+-	else if(auth_mode == "radius")
+-		security_mode = "Radius with 802.1x";
+-
+-	//$("wl_securitylevel_span").innerHTML = security_mode;
+-
+-	if(auth_mode == "open" && wl_wep_x == 0) {
+-		$j("#wl_securitylevel_span").addClass("badge badge-important");
+-		$j("#wl_securitylevel_span").html('<i class="icon-exclamation-sign icon-white"></i>');
+-	} else {
+-		$j("#wl_securitylevel_span").addClass("badge badge-success");
+-		$j("#wl_securitylevel_span").html('<i class="icon-lock icon-white"></i>');
+-	}
+-}
+-
+-function show_client_status(clients_count){
+-	var client_str = "";
+-	var wired_num = 0, wireless_num = 0;
+-
+-	client_str += "<#Full_Clients#>: <span>"+clients_count+"</span>";
+-
+-	$j("#clientNumber").addClass("badge badge-success");
+-	if(clients_count < 10)
+-		$j("#clientNumber").css({paddingLeft: '6px', paddingRight: '7px'});
+-	else
+-		$j("#clientNumber").css({paddingLeft: '3px', paddingRight: '4px'});
+-
+-	$j("#clientNumber").html(clients_count);
+-}
+-
+-function show_usb_ports(){
+-	var i;
+-	var dev_type_usb;
+-	var usb_ports_num = get_usb_ports_num();
+-
+-	if (usb_ports_num < 1) {
+-		$("row_usb_port1").style.display = "none";
+-		return;
+-	}
+-
+-	dev_type_usb = get_device_type_usb(1);
+-	switch(dev_type_usb){
+-		case "hub":
+-			hub_html(0);
+-			break;
+-		case "storage":
+-			for(i = 0; i < all_disks.length; ++i)
+-				if(foreign_disk_interface_names()[i] == "1"){
+-					disk_html(0, i);
+-					break;
+-				}
+-			break;
+-		case "printer":
+-			for(i = 0; i < printer_ports().length; ++i)
+-				if(printer_ports()[i] == "1"){
+-					printer_html(0, i);
+-					break;
+-				}
+-			break;
+-		case "modem_tty":
+-		case "modem_eth":
+-			for(i = 0; i < modem_ports().length; ++i)
+-				if(modem_ports()[i] == "1"){
+-					modem_html(0, i);
+-					break;
+-				}
+-			break;
+-		default:
+-			no_usb_device_html(0);
+-	}
+-
+-	if (usb_ports_num < 2)
+-		return;
+-
+-	$("row_usb_port2").style.display = "";
+-
+-	dev_type_usb = get_device_type_usb(2);
+-	switch(dev_type_usb){
+-		case "hub":
+-			hub_html(1);
+-			break;
+-		case "storage":
+-			for(i = 0; i < all_disks.length; ++i)
+-				if(foreign_disk_interface_names()[i] == "2"){
+-					disk_html(1, i);
+-					break;
+-				}
+-			break;
+-		case "printer":
+-			for(i = 0; i < printer_ports().length; ++i)
+-				if(printer_ports()[i] == "2"){
+-					printer_html(1, i);
+-					break;
+-				}
+-			break;
+-		case "modem_tty":
+-		case "modem_eth":
+-			for(i = 0; i < modem_ports().length; ++i)
+-				if(modem_ports()[i] == "2"){
+-					modem_html(1, i);
+-					break;
+-				}
+-			break;
+-		default:
+-			no_usb_device_html(1);
+-	}
+-}
+-
+-function show_ata_pool(){
+-	var i;
+-	var dev_found = 0;
+-
+-	if (typeof(get_ata_support) !== 'function')
+-		return;
+-
+-	if (!get_ata_support())
+-		return;
+-
+-	$("row_ata_pool").style.display = "";
+-
+-	for(i = 0; i < all_disks.length; ++i){
+-		if(foreign_disk_interface_names()[i] == "1000"){
+-			dev_found = 1;
+-			ata_html(i);
+-			break;
+-		}
+-	}
+-
+-	if (!dev_found)
+-		no_device_html("sataIcon");
+-}
+-
+-function show_mmc_card(){
+-	var i;
+-	var dev_found = 0;
+-
+-	if (typeof(get_mmc_support) !== 'function')
+-		return;
+-
+-	if (!get_mmc_support())
+-		return;
+-
+-	$("row_mmc_slot").style.display = "";
+-
+-	for(i = 0; i < all_disks.length; ++i){
+-		if(foreign_disk_interface_names()[i] == "2000"){
+-			dev_found = 1;
+-			mmc_html(i);
+-			break;
+-		}
+-	}
+-
+-	if (!dev_found)
+-		no_device_html("cardIcon");
+-}
+-
+-function dec_html(all_disk_order){
+-	var dec_html_code = '';
+-	var TotalSize;
+-	var all_accessable_size;
+-	var percentbar = 0;
+-	var alertPercentbar = 'progress-info';
+-	var mount_num = getDiskMountedNum(all_disk_order);
+-
+-	if(mount_num > 0){
+-		if(all_disk_order < foreign_disks().length)
+-			TotalSize = simpleNum(foreign_disk_total_size()[all_disk_order]);
+-		else
+-			TotalSize = simpleNum(blank_disk_total_size()[all_disk_order-foreign_disks().length]);
+-		
+-		all_accessable_size = simpleNum2(computeallpools(all_disk_order, "size")-computeallpools(all_disk_order, "size_in_use"));
+-		
+-		percentbar = simpleNum2((all_accessable_size)/TotalSize*100);
+-		percentbar = Math.round(100-percentbar);
+-		if(percentbar >= 66 && percentbar < 85)
+-			alertPercentbar = 'progress-warning';
+-		else if(percentbar >= 85)
+-			alertPercentbar = 'progress-danger';
+-		dec_html_code += '<div id="diskquota">\n';
+-		dec_html_code += '<div style="margin-bottom: 10px;" class="progress ' + alertPercentbar + '"><div class="bar" style="width:'+percentbar+'%">'+(percentbar > 10 ? (percentbar + '%') : '')+'</div></div>';
+-		dec_html_code += '</div>\n';
+-		dec_html_code += '<strong><#Totaldisk#></strong>: '+TotalSize+' GB<br>\n';
+-		dec_html_code += '<span class="style1"><strong><#Availdisk#></strong>: '+(all_accessable_size)+' GB</span>\n';
+-	}else
+-		dec_html_code += '<span class="style1"><strong><#DISK_UNMOUNTED#></strong></span>\n';
+-
+-	return dec_html_code;
+-}
+-
+-function dec_share_icon(device_dec){
+-	device_dec.addClass("badge badge-success");
+-	device_dec.css({paddingLeft: '3px'});
+-	device_dec.html('<i class="icon-share icon-white"></i>');
+-}
+-
+-function disk_html(device_order,all_disk_order){
+-	var device_icon = $("deviceIcon_"+device_order);
+-	var device_dec = $j("#deviceDec_"+device_order);
+-	var icon_html_code = '';
+-	var dec_html_code = '';
+-	var disk_model_name = "";
+-
+-	if(all_disk_order < foreign_disks().length)
+-		disk_model_name = foreign_disk_model_info()[all_disk_order];
+-	else
+-		disk_model_name = blank_disks()[all_disk_order-foreign_disks().length];
+-
+-	dec_html_code = dec_html(all_disk_order);
+-
+-	icon_html_code += '<a href="device-map/disk.asp" target="statusframe" style="outline:0;">\n';
+-	icon_html_code += '    <div id="iconUSBdisk'+all_disk_order+'" class="big-icons big-icons-usbhdd" rel="rollover_disk" data-original-title="'+disk_model_name+'" data-content="'+(dec_html_code.replace(new RegExp('"', 'g'), "'"))+'" onclick="setSelectedDiskOrder(this.id);clickEvent(this);"></div>\n';
+-	icon_html_code += '</a>\n';
+-
+-	device_icon.innerHTML = icon_html_code;
+-
+-	dec_share_icon(device_dec);
+-}
+-
+-function printer_html(device_seat, printer_order){
+-	var device_icon = $("deviceIcon_"+device_seat);
+-	var device_dec = $j("#deviceDec_"+device_seat);
+-	var icon_html_code = '';
+-
+-	icon_html_code += '<a href="device-map/printer.asp" target="statusframe" style="outline:0;">\n';
+-	icon_html_code += '    <div id="iconPrinter'+printer_order+'" class="big-icons big-icons-printer" onclick="clickEvent(this);"></div>\n';
+-	icon_html_code += '</a>\n';
+-
+-	device_icon.innerHTML = icon_html_code;
+-
+-	dec_share_icon(device_dec);
+-}
+-
+-function modem_html(device_seat, modem_order){
+-	var device_icon = $("deviceIcon_"+device_seat);
+-	var device_dec = $j("#deviceDec_"+device_seat);
+-	var icon_html_code = '';
+-
+-	icon_html_code += '<a href="device-map/modem.asp" target="statusframe" style="outline:0;">\n';
+-	icon_html_code += '    <div id="iconModem'+modem_order+'" class="big-icons big-icons-modem" onclick="clickEvent(this);"></div>\n';
+-	icon_html_code += '</a>\n';
+-
+-	device_icon.innerHTML = icon_html_code;
+-
+-	dec_share_icon(device_dec);
+-}
+-
+-function hub_html(device_seat){
+-	var device_icon = $("deviceIcon_"+device_seat);
+-	var device_dec = $j("#deviceDec_"+device_seat);
+-	var icon_html_code = '';
+-
+-	icon_html_code += '<a href="device-map/hub.asp" target="statusframe" style="outline:0;">\n';
+-	icon_html_code += '    <div id="iconHub'+device_seat+'" class="big-icons big-icons-hub" onclick="clickEvent(this);"></div>\n';
+-	icon_html_code += '</a>\n';
+-
+-	device_icon.innerHTML = icon_html_code;
+-
+-	dec_share_icon(device_dec);
+-}
+-
+-function ata_html(){
+-	var device_icon = $("sataIcon");
+-	var device_dec = $j("#sataDec");
+-	var icon_html_code = '';
+-
+-	icon_html_code += '<a href="device-map/sata.asp" target="statusframe" style="outline:0;">\n';
+-	icon_html_code += '    <div id="iconSATA" class="big-icons big-icons-ata" onclick="clickEvent(this);"></div>\n';
+-	icon_html_code += '</a>\n';
+-
+-	device_icon.innerHTML = icon_html_code;
+-
+-	dec_share_icon(device_dec);
+-}
+-
+-function mmc_html(all_disk_order){
+-	var device_icon = $("cardIcon");
+-	var device_dec = $j("#cardDec");
+-	var icon_html_code = '';
+-	var dec_html_code = '';
+-	var disk_model_name = "";
+-
+-	if(all_disk_order < foreign_disks().length)
+-		disk_model_name = foreign_disk_model_info()[all_disk_order];
+-	else
+-		disk_model_name = blank_disks()[all_disk_order-foreign_disks().length];
+-
+-	dec_html_code = dec_html(all_disk_order);
+-
+-	icon_html_code += '<a href="device-map/disk.asp" target="statusframe" style="outline:0;">\n';
+-	icon_html_code += '    <div id="iconCard'+all_disk_order+'" class="big-icons big-icons-mmc" rel="rollover_disk" data-original-title="'+disk_model_name+'" data-content="'+(dec_html_code.replace(new RegExp('"', 'g'), "'"))+'" onclick="setSelectedDiskOrder(this.id);clickEvent(this);"></div>\n';
+-	icon_html_code += '</a>\n';
+-
+-	device_icon.innerHTML = icon_html_code;
+-
+-	dec_share_icon(device_dec);
+-}
+-
+-function no_device_html(device_name){
+-	var device_icon = $(device_name);
+-	device_icon.innerHTML = '<div class="iconNo"></div>'
+-}
+-
+-function no_usb_device_html(device_seat){
+-	no_device_html("deviceIcon_"+device_seat);
+-}
+-
+-
+-var avoidkey;
+-var lastClicked;
+-var lastName;
+-var clicked_device_order;
+-
+-function get_clicked_device_order(){
+-	return clicked_device_order;
+-}
+-
+-function clickEvent(obj){
+-	var icon;
+-	var ContainerWidth;
+-	var Containerpadding;
+-	var stitle;
+-	var seat;
+-
+-	clicked_device_order = -1;
+-
+-	if(obj.id == "iflock"){
+-		obj = $("big-icons-router-active");
+-	}
+-
+-	if(obj.id.indexOf("Internet") > 0){
+-		icon = "big-icons-globe-active";
+-		ContainerWidth = "300px";
+-		Containerpadding = "5px";
+-		if (sw_mode == '3'){
+-			stitle = "<#statusTitle_Intranet#>";
+-			$("statusframe").src = "/device-map/intranet.asp";
+-		}else{
+-			stitle = "<#statusTitle_Internet#>";
+-			$("statusframe").src = "/device-map/internet.asp";
+-		}
+-	}
+-	else if(obj.id.indexOf("Router") > 0){
+-		icon = "big-icons-router-active";
+-		ContainerWidth = "320px";
+-		Containerpadding = "4px";
+-		stitle = "<#statusTitle_System#>";
+-	}
+-	else if(obj.id.indexOf("Client") > 0){
+-		icon = "big-icons-laptop-active";
+-		ContainerWidth = "396px";
+-		Containerpadding = "0px";
+-		stitle = "<#statusTitle_Client#>";
+-	}
+-	else if(obj.id.indexOf("USBdisk") > 0){
+-		icon = "big-icons-usbhdd-active";
+-		ContainerWidth = "556px";
+-		Containerpadding = "0px";
+-		stitle = "<#statusTitle_USB_Disk#>";
+-		$("statusframe").src = "/device-map/disk.asp";
+-	}
+-	else if(obj.id.indexOf("Printer") > 0){
+-		seat = obj.id.indexOf("Printer")+7;
+-		clicked_device_order = parseInt(obj.id.substring(seat, seat+1));
+-		icon = "big-icons-printer-active";
+-		ContainerWidth = "666px";
+-		Containerpadding = "0px";
+-		stitle = "<#statusTitle_Printer#>";
+-		$("statusframe").src = "/device-map/printer.asp";
+-	}
+-	else if(obj.id.indexOf("Modem") > 0){
+-		seat = obj.id.indexOf("Modem")+5;
+-		clicked_device_order = parseInt(obj.id.substring(seat, seat+1));
+-		icon = "big-icons-modem-active";
+-		ContainerWidth = "777px";
+-		Containerpadding = "0px";
+-		stitle = "<#statusTitle_Modem#>";
+-		$("statusframe").src = "/device-map/modem.asp";
+-	}
+-	else if(obj.id.indexOf("Hub") > 0){
+-		seat = obj.id.indexOf("Hub")+3;
+-		clicked_device_order = parseInt(obj.id.substring(seat, seat+1));
+-		icon = "big-icons-hub-active";
+-		ContainerWidth = "892px";
+-		Containerpadding = "0px";
+-		stitle = "<#statusTitle_Hub#>";
+-		$("statusframe").src = "/device-map/hub.asp";
+-	}
+-	else if(obj.id.indexOf("SATA") > 0){
+-		icon = "big-icons-ata-active";
+-		ContainerWidth = "892px";
+-		Containerpadding = "0px";
+-		stitle = "<#statusTitle_SATA#>";
+-		$("statusframe").src = "/device-map/sata.asp";
+-	}
+-	else if(obj.id.indexOf("Card") > 0){
+-		icon = "big-icons-mmc-active";
+-		ContainerWidth = "892px";
+-		Containerpadding = "0px";
+-		stitle = "<#statusTitle_Card#>";
+-		$("statusframe").src = "/device-map/disk.asp";
+-	}
+-	else if(obj.id.indexOf("No") > 0){
+-		icon = "iconNo";
+-	}
+-
+-	$('statusContainer').style.width = ContainerWidth;
+-	$('statusContainer').style.paddingRight = Containerpadding;
+-
+-	$j(".big-icons").removeClass("big-icons-globe-active big-icons-router-active big-icons-laptop-active big-icons-usb-active big-icons-usbhdd-active big-icons-printer-active big-icons-modem-active big-icons-hub-active big-icons-mmc-active big-icons-ata-active");
+-	$j(obj).addClass(icon);
+-
+-	// show arrow right icon
+-	$j(".arrow-right").hide();
+-	$j(obj).parents('tr').find(".arrow-right").show();
+-
+-	$('helpname').innerHTML = stitle;
+-
+-	avoidkey = icon;
+-	lastClicked = obj;
+-	lastName = icon;
+-}
+-
+-function mouseEvent(obj, key){
+-	var icon;
+-
+-	if(obj.id.indexOf("Internet") > 0)
+-		icon = "iconInternet";
+-	else if(obj.id.indexOf("Router") > 0)
+-		icon = "iconRouter";
+-	else if(obj.id.indexOf("Client") > 0)
+-		icon = "iconClient";
+-	else if(obj.id.indexOf("USBdisk") > 0)
+-		icon = "iconUSBdisk";
+-	else if(obj.id.indexOf("Printer") > 0)
+-		icon = "iconPrinter";
+-	else if(obj.id.indexOf("No") > 0)
+-		icon = "iconNo";
+-	else
+-		alert("mouse over on wrong place!");
+-
+-	if(avoidkey != icon){
+-		if(key)
+-			obj.style.background = 'url("/images/map-'+icon+'_r.gif") no-repeat';
+-		else
+-			obj.style.background = 'url("/images/map-'+icon+'.gif") no-repeat';
+-	}
+-}
+-
+-$j(document).ready(function(){
+-	$j('div[rel=rollover_disk]').popover();
+-});
+-</script>
+-
+-<style>
+-    .arrow-right{
+-        position: absolute;
+-        margin-top: -39px;
+-        margin-left: 69px;
+-        display: none;
+-    }
+-
+-    .badge{
+-        padding: 2px;
+-        padding-bottom: 3px;
+-    }
+-
+-    .table-big td{
+-        padding-top: 16px;
+-        padding-bottom: 16px;
+-    }
+-
+-    .progress {
+-        background-image: -moz-linear-gradient(top, #f3f3f3, #dddddd);
+-        background-image: -ms-linear-gradient(top, #f3f3f3, #dddddd);
+-        background-image: -webkit-gradient(linear, 0 0, 0 100%, from(#f3f3f3), to(#dddddd));
+-        background-image: -webkit-linear-gradient(top, #f3f3f3, #dddddd);
+-        background-image: -o-linear-gradient(top, #f3f3f3, #dddddd);
+-        background-image: linear-gradient(top, #f3f3f3, #dddddd);
+-        filter: progid:dximagetransform.microsoft.gradient(startColorstr='#f3f3f3', endColorstr='#dddddd', GradientType=0);
+-    }
+-</style>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <meta http-equiv="Pragma" content="no-cache">
++  <meta http-equiv="Expires" content="-1">
++  <title>TOTOLINK N9v1 — Access Point Admin</title>
++  <link rel="icon" href="/images/favicon.png">
++  <link rel="stylesheet" href="/ap_ui.css">
+ </head>
+-
+-<body onunload="return unload_body();">
+-
+-<div class="wrapper">
+-    <noscript>
+-        <div class="popup_bg" style="visibility:visible; z-index:999;">
+-            <div style="margin:200px auto; width:300px; background-color:#006699; color:#FFFFFF; line-height:150%; border:3px solid #FFF; padding:5px;"><#not_support_script#></p></div>
+-        </div>
+-    </noscript>
+-
+-    <div class="container-fluid" style="padding-right: 0px">
+-        <div class="row-fluid">
+-            <div class="span3"><center><div id="logo"></div></center></div>
+-            <div class="span9" >
+-                <div id="TopBanner"></div>
+-            </div>
+-        </div>
++<body>
++  <div id="app">
++    <div style="max-width:420px;margin:80px auto;text-align:center;color:#64748b;font-family:system-ui,sans-serif;font-size:13px">
++      Loading TOTOLINK N9v1 Admin Interface...
+     </div>
+-
+-    <div id="Loading" class="popup_bg"></div>
+-
+-    <iframe name="hidden_frame" id="hidden_frame" width="0" height="0" frameborder="0" scrolling="no" style="position: absolute;"></iframe>
+-
+-    <form name="form">
+-    <input type="hidden" name="current_page" value="index.asp">
+-    <input type="hidden" name="preferred_lang" id="preferred_lang" value="<% nvram_get_x("", "preferred_lang"); %>">
+-    <input type="hidden" name="wl_auth_mode" value="<% nvram_get_x("",  "wl_auth_mode"); %>">
+-    <input type="hidden" name="wl_wpa_mode" value="<% nvram_get_x("",  "wl_wpa_mode"); %>">
+-    <input type="hidden" name="wl_wep_x" value="<% nvram_get_x("",  "wl_wep_x"); %>">
+-    <input type="hidden" name="rt_auth_mode" value="<% nvram_get_x("",  "rt_auth_mode"); %>">
+-    <input type="hidden" name="rt_wpa_mode" value="<% nvram_get_x("",  "rt_wpa_mode"); %>">
+-    <input type="hidden" name="rt_wep_x" value="<% nvram_get_x("",  "rt_wep_x"); %>">
+-    </form>
+-
+-    <form name="rt_form">
+-    <input type="hidden" name="rt_ssid" value="">
+-    <input type="hidden" name="rt_wpa_mode" value="">
+-    <input type="hidden" name="rt_key1" value="">
+-    <input type="hidden" name="rt_key2" value="">
+-    <input type="hidden" name="rt_key3" value="">
+-    <input type="hidden" name="rt_key4" value="">
+-    <input type="hidden" name="rt_ssid2" value="">
+-    <input type="hidden" name="rt_key_type" value="">
+-    <input type="hidden" name="rt_auth_mode" value="">
+-    <input type="hidden" name="rt_wep_x" value="">
+-    <input type="hidden" name="rt_key" value="">
+-    <input type="hidden" name="rt_asuskey1" value="">
+-    <input type="hidden" name="rt_crypto" value="">
+-    <input type="hidden" name="rt_wpa_psk" value="">
+-    </form>
+-
+-    <form name="wl_form">
+-    <input type="hidden" name="wl_ssid" value="">
+-    <input type="hidden" name="wl_wpa_mode" value="">
+-    <input type="hidden" name="wl_key1" value="">
+-    <input type="hidden" name="wl_key2" value="">
+-    <input type="hidden" name="wl_key3" value="">
+-    <input type="hidden" name="wl_key4" value="">
+-    <input type="hidden" name="wl_gmode" value="">
+-    <input type="hidden" name="wl_ssid2" value="">
+-    <input type="hidden" name="wl_key_type" value="">
+-    <input type="hidden" name="wl_auth_mode" value="">
+-    <input type="hidden" name="wl_wep_x" value="">
+-    <input type="hidden" name="wl_key" value="">
+-    <input type="hidden" name="wl_asuskey1" value="">
+-    <input type="hidden" name="wl_crypto" value="">
+-    <input type="hidden" name="wl_wpa_psk" value="">
+-    </form>
+-
+-    <div class="container-fluid">
+-        <div class="row-fluid">
+-            <div class="span3">
+-                <!--Sidebar content-->
+-                <!--=====Beginning of Main Menu=====-->
+-                <div class="well sidebar-nav side_nav" style="padding: 0px;">
+-                    <ul id="mainMenu" class="clearfix"></ul>
+-                    <ul class="clearfix">
+-                        <li>
+-                            <div id="subMenu" class="accordion"></div>
+-                        </li>
+-                    </ul>
+-                </div>
+-            </div>
+-
+-            <div class="span9">
+-                <!--Body content-->
+-
+-                <div class="row-fluid">
+-                    <div class="span2">
+-                        <div class="well" style="height: 570px; padding-left: 18px;">
+-                            <div id="tabMenu"></div>
+-
+-                            <table class="table table-big" style="margin-top: 12px;">
+-                                <tbody>
+-                                    <tr id="row_internet">
+-                                        <td width="30%">
+-                                            <a id="linkInternet" href="/device-map/internet.asp" target="statusframe" style="outline:0;">
+-                                                <div id="iconInternet" class="big-icons big-icons-globe" onclick="clickEvent(this);"></div>
+-                                            </a>
+-                                            <div id="overDiv" style="position:absolute; visibility:hidden; z-index:1000;"></div>
+-                                            <div style="position: absolute; margin-top: -47px; margin-left: 50px;"><div id="internetStatus" style="padding-left: 3px;"></div></div>
+-                                            <div class="arrow-right" id="arrow-internet"><img src="/bootstrap/img/arrow-right.png"></div>
+-                                        </td>
+-                                    </tr>
+-                                    <tr id="row_radio">
+-                                        <td width="30%">
+-                                            <a href="device-map/router2g.asp" target="statusframe" style="outline:0;"><div id="iconRouter" class="big-icons big-icons-router" onclick="clickEvent(this);"></div></a>
+-                                            <div style="position: absolute; margin-top: -47px; margin-left: 50px;"><div id="wl_securitylevel_span" style="padding-right: 3px;"></div></div>
+-                                            <div class="arrow-right" id="arrow-router"><img src="/bootstrap/img/arrow-right.png"></div>
+-                                        </td>
+-                                    </tr>
+-                                    <tr>
+-                                        <td>
+-                                            <a id="clientStatusLink" href="device-map/clients.asp" target="statusframe" style="outline:0;"><div id="iconClient" class="big-icons big-icons-laptop" onclick="clickEvent(this);"></div></a>
+-                                            <div style="position: absolute; margin-top: -47px; margin-left: 50px;"><b><div id="clientNumber">&nbsp;</div></b></div>
+-                                            <div class="arrow-right" id="arrow-clients"><img src="/bootstrap/img/arrow-right.png"></div>
+-                                        </td>
+-                                    </tr>
+-                                    <tr id="row_usb_port1">
+-                                        <td width="30%">
+-                                            <div id="deviceIcon_0" class="big-icons big-icons-usb"></div>
+-                                            <div style="position: absolute; margin-top: -47px; margin-left: 50px;"><div id="deviceDec_0"></div></div>
+-                                            <div class="arrow-right" id="arrow-usb1"><img src="/bootstrap/img/arrow-right.png"></div>
+-                                        </td>
+-                                    </tr>
+-                                    <tr id="row_usb_port2" style="display:none">
+-                                        <td width="30%">
+-                                            <div id="deviceIcon_1" class="big-icons big-icons-usb"></div>
+-                                            <div style="position: absolute; margin-top: -47px; margin-left: 50px;"><div id="deviceDec_1"></div></div>
+-                                            <div class="arrow-right" id="arrow-usb2"><img src="/bootstrap/img/arrow-right.png"></div>
+-                                        </td>
+-                                    </tr>
+-                                    <tr id="row_ata_pool" style="display:none">
+-                                        <td width="30%">
+-                                            <div id="sataIcon" class="big-icons big-icons-ata"></div>
+-                                            <div style="position: absolute; margin-top: -47px; margin-left: 50px;"><div id="sataDec"></div></div>
+-                                            <div class="arrow-right" id="arrow-ata"><img src="/bootstrap/img/arrow-right.png"></div>
+-                                        </td>
+-                                    </tr>
+-                                    <tr id="row_mmc_slot" style="display:none">
+-                                        <td width="30%">
+-                                            <div id="cardIcon" class="big-icons big-icons-mmc"></div>
+-                                            <div style="position: absolute; margin-top: -47px; margin-left: 50px;"><div id="cardDec"></div></div>
+-                                            <div class="arrow-right" id="arrow-mmc"><img src="/bootstrap/img/arrow-right.png"></div>
+-                                        </td>
+-                                    </tr>
+-                                </tbody>
+-                            </table>
+-
+-                            <div class="row-fluid">
+-                                <div class="span12">
+-                                    <div id="statusContainer" width="0" height="0" align="left" valign="top" ></div>
+-                                </div>
+-                            </div>
+-
+-                        </div>
+-                    </div>
+-
+-                    <div class="span10">
+-                        <div class="box well grad_colour_dark_blue">
+-                            <div id="statusIcon" style="display: none"></div>
+-                            <h2 id="helpname" class="box_head round_top"></h2>
+-
+-                            <div class="round_bottom">
+-                                <iframe id="statusframe" name="statusframe" src="/device-map/clients.asp" frameborder="0" width="100%" height="571"></iframe>
+-                            </div>
+-                        </div>
+-                    </div>
+-                </div>
+-            </div>
+-        </div>
++  </div>
++  <noscript>
++    <div style="text-align:center;padding:30px;font-family:sans-serif">
++      JavaScript and WebAssembly are required. <a href="/classic.asp">Open Classic UI</a>
+     </div>
+-
+-    <div id="footer"></div>
+-    <script>
+-    if(flag == "Internet" || flag == "Client")
+-        $("statusframe").src = "";
+-        initial();
+-    </script>
+-</div>
++  </noscript>
++  <script src="/ap_ui.js"></script>
+ </body>
+ </html>
+diff --git a/trunk/user/www/n56u_ribbon_fixed/state.js b/trunk/user/www/n56u_ribbon_fixed/state.js
+index 35e60c4a3..863c0be5f 100644
+--- a/trunk/user/www/n56u_ribbon_fixed/state.js
++++ b/trunk/user/www/n56u_ribbon_fixed/state.js
+@@ -74,7 +74,7 @@ function update_internet_status(){
+ 
+ function notify_status_internet(wan_internet){
+ 	this.new_wan_internet = wan_internet;
+-	if((location.pathname == "/" || location.pathname == "/index.asp") && (typeof(update_internet_status) === 'function'))
++	if((location.pathname == "/" || location.pathname == "/classic.asp" || location.pathname == "/index.asp") && (typeof(update_internet_status) === 'function'))
+ 		update_internet_status();
+ }
+ 
+@@ -359,7 +359,7 @@ function show_banner(L3){
+ 	bc += '  </tr>\n';
+ 	bc += '  <tr>\n';
+ 	bc += '    <td><button type="button" id="commit_btn" class="btn btn-mini" style="width: 114px; height: 21px; outline:0; '+enabledBtnCommit+'" onclick="commit();"><i class="icon icon-fire"></i>&nbsp;<#CTL_Commit#></button></td>\n';
+-	bc += '    <td><button type="button" id="logout_btn" class="btn btn-mini" style="height: 21px; outline:0;" title="<#t1Logout#>" onclick="logout();"><i class="icon icon-user"></i></button> <button type="button" id="reboto_btn" class="btn btn-mini" style="height: 21px; outline:0;" title="<#BTN_REBOOT#>" onclick="reboot();"><i class="icon icon-repeat"></i></button> <button type="button" id="shutdown_btn" class="btn btn-mini" style="height: 21px; outline:0;" title="<#BTN_SHUTDOWN#>" onclick="shutdown();"><i class="icon icon-off"></i></button></td>\n';
++	bc += '    <td><button type="button" id="logout_btn" class="btn btn-mini" style="height: 21px; outline:0;" title="<#t1Logout#>" onclick="logout();"><i class="icon icon-user"></i></button> <button type="button" id="reboto_btn" class="btn btn-mini" style="height: 21px; outline:0;" title="<#BTN_REBOOT#>" onclick="reboot();"><i class="icon icon-repeat"></i></button> <button type="button" id="shutdown_btn" class="btn btn-mini" style="height: 21px; outline:0;" title="<#BTN_SHUTDOWN#>" onclick="shutdown();"><i class="icon icon-off"></i></button> <a href="/" class="btn btn-mini btn-info" style="height: 15px; line-height: 15px;" title="Return to Light Admin UI">Light UI</a></td>\n';
+ 	bc += '  </tr>\n';
+ 	bc += '</table>\n';
+ 	bc += '</div>\n';
+@@ -470,7 +470,7 @@ if (found_app_mentohust()){
+ 
+ //Level 1 Menu in Gateway, Router mode
+ menuL1_title = new Array("", "<#menu1#>", "", "", "", "<#menu4#>", "<#menu5_8#>", "<#menu5#>");
+-menuL1_link = new Array("", "index.asp", "", "", "", "Main_TrafficMonitor_realtime.asp", "Advanced_System_Info.asp", "as.asp");
++menuL1_link = new Array("", "classic.asp", "", "", "", "Main_TrafficMonitor_realtime.asp", "Advanced_System_Info.asp", "as.asp");
+ menuL1_icon = new Array("", "icon-home", "icon-hdd", "icon-retweet", "icon-globe", "icon-tasks", "icon-random", "icon-wrench");
+ 
+ function show_menu(L1, L2, L3){
+@@ -700,7 +700,7 @@ function submit_language(){
+ 			action = "/start_apply.htm";
+ 			
+ 			if(location.pathname == "/")
+-				current_page.value = "/index.asp";
++				current_page.value = "/classic.asp";
+ 			else
+ 				current_page.value = location.pathname;
+ 			
+@@ -1092,7 +1092,7 @@ function gotoprev(formObj){
+ 	var prev_page = formObj.prev_page.value;
+ 
+ 	if(prev_page == "/")
+-		prev_page = "/index.asp";
++		prev_page = "/classic.asp";
+ 
+ 	formObj.action = prev_page;
+ 	formObj.target = "_parent";
